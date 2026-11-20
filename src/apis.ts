@@ -15,6 +15,14 @@ export interface ApiConfig {
     apiKey: string;
     /** 这台服务商上有哪些模型。用户手填，也可以从接口拉 */
     models: string[];
+    /**
+     * 勾选要用的模型（多选）。
+     *
+     * 和 models 的区别：models 是"这台服务商上有哪些"，
+     * picked 是"我要在日常切换里出现哪几个"。
+     * 拉回来几十个模型时，只勾常用的几个，顶栏就不会一屏都是。
+     */
+    picked: string[];
     /** 当前选中哪个模型。切换 API 时跟着这个走 */
     model: string;
 }
@@ -37,6 +45,16 @@ export function createApi(partial: Partial<ApiConfig> = {}, id = newApiId()): Ap
     const model = typeof partial.model === "string" ? partial.model.trim() : "";
     // 手改配置里可能出现「model 不在 models 里」，补进去，否则下拉里看不到当前模型
     if (model && !models.includes(model)) models.push(model);
+    // 老配置没有 picked：默认把所有模型都算"选过的"，行为和老版本一致，
+    // 主人不会升级完发现顶栏突然空了。
+    const rawPicked = Array.isArray(partial.picked) ? partial.picked : null;
+    const pickedBase = rawPicked
+        ? rawPicked.filter((m): m is string => typeof m === "string").map((m) => m.trim())
+        : [...models];
+    const picked = pickedBase.filter((m) => m && models.includes(m));
+    // 当前模型必须在 picked 里，否则顶栏选了它却又不显示
+    if (model && !picked.includes(model)) picked.push(model);
+
     return {
         id,
         name: typeof partial.name === "string" ? partial.name.trim() : "",
@@ -44,6 +62,7 @@ export function createApi(partial: Partial<ApiConfig> = {}, id = newApiId()): Ap
         baseURL: typeof partial.baseURL === "string" ? partial.baseURL.trim() : "",
         apiKey: typeof partial.apiKey === "string" ? partial.apiKey : "",
         models,
+        picked,
         model,
     };
 }
@@ -65,6 +84,37 @@ export function normalizeApis(raw: unknown): ApiConfig[] {
         out.push(createApi(o, id));
     }
     return out;
+}
+
+/** 当前勾选的清单；老对象可能根本没这个字段，当作"全选" */
+export function pickedOf(api: ApiConfig): string[] {
+    const p = Array.isArray(api?.picked) ? api.picked : [];
+    return p.length ? p : Array.isArray(api?.models) ? api.models : [];
+}
+
+/** 勾上/取消一个模型（用于"多选"）。返回新数组，不改原对象 */
+export function togglePick(api: ApiConfig, name: string): ApiConfig {
+    const cur = pickedOf(api);
+    const has = cur.includes(name);
+    // 取消勾选时不能把正在用的那个也取消掉，否则顶栏显示的名字会消失
+    if (api.model === name && has) return api;
+
+    let picked = has ? cur.filter((m) => m !== name) : [...cur, name];
+
+    // 至少留一个：全取消会让这套 API 变成"没有模型可用"
+    if (!picked.length) {
+        picked = [api.model || api.models?.[0] || ""].filter(Boolean);
+    }
+    return { ...api, picked };
+}
+
+export function isPicked(api: ApiConfig, name: string): boolean {
+    return pickedOf(api).includes(name);
+}
+
+/** 顶栏该列哪些模型：只列勾过的；一个都没勾就退回全部 */
+export function visibleModels(api: ApiConfig): string[] {
+    return pickedOf(api);
 }
 
 export function findApi(list: ApiConfig[], id: string): ApiConfig | undefined {
@@ -157,6 +207,8 @@ export function modelsHeaders(protocol: Protocol, apiKey: string): Record<string
 export interface ModelFetchResult {
     /** 能聊天的那些（已滤掉 embedding 之类） */
     models: string[];
+    /** 画图模型：不能聊天，但生图要用 */
+    imageModels: string[];
     /** 被滤掉的数量，用来给用户一句人话 */
     skipped: number;
     error: string;
@@ -177,36 +229,38 @@ export async function fetchModels(
     api: Pick<ApiConfig, "protocol" | "baseURL" | "apiKey">,
     fetcher: Fetcher
 ): Promise<ModelFetchResult> {
-    if (!api.baseURL.trim()) return { models: [], skipped: 0, error: "先填接口地址" };
+    const empty: ModelFetchResult = { models: [], imageModels: [], skipped: 0, error: "" };
+    if (!api.baseURL.trim()) return { ...empty, error: "先填接口地址" };
 
     const url = modelsEndpoint(api.protocol, api.baseURL);
     let resp;
     try {
         resp = await fetcher(url, { method: "GET", headers: modelsHeaders(api.protocol, api.apiKey) });
     } catch (e: any) {
-        return { models: [], skipped: 0, error: String(e?.message || e) };
+        return { ...empty, error: String(e?.message || e) };
     }
 
     const text = await resp.text().catch(() => "");
     if (!resp.ok) {
         const detail = text ? "：" + text.slice(0, 160) : "";
-        return { models: [], skipped: 0, error: `接口返回 ${resp.status}${detail}` };
+        return { ...empty, error: `接口返回 ${resp.status}${detail}` };
     }
 
     let json: any = null;
     try {
         json = JSON.parse(text);
     } catch {
-        return { models: [], skipped: 0, error: "返回的不是 JSON，可能这个中转站不开放模型列表" };
+        return { ...empty, error: "返回的不是 JSON，可能这个中转站不开放模型列表" };
     }
 
     const all = parseModelList(api.protocol, json);
-    if (!all.length) return { models: [], skipped: 0, error: "接口没返回任何模型，手动填吧" };
+    if (!all.length) return { ...empty, error: "接口没返回任何模型，手动填吧" };
 
-    const { chat, skipped } = splitChatModels(all);
-    // 全被滤掉了说明名单可能误杀，宁可全放出来让用户自己挑，也不要给个空清单
-    if (!chat.length) return { models: all, skipped: 0, error: "" };
-    return { models: chat, skipped, error: "" };
+    const { chat, image, skipped } = splitChatModels(all);
+    // 聊天和画图都被滤光了，说明名单可能误杀。
+    // 宁可全放出来让用户自己挑，也不要给个空清单。
+    if (!chat.length && !image.length) return { ...empty, models: all };
+    return { models: chat, imageModels: image, skipped, error: "" };
 }
 
 /** 把拉回来的模型合并进现有清单，保留已有顺序 */
@@ -219,13 +273,56 @@ export function mergeModels(current: string[], incoming: string[]): string[] {
 }
 
 /**
- * 明显不能聊天的模型名。
+ * 画图模型名。
  *
- * 中转站的 /models 会把 embedding、语音、画图的模型混在一起，
+ * 这类模型走的是另一套接口（/images/generations），拿它聊天必然 400。
+ * 但它们不是"垃圾名字"：主人在生图模式里正要用它们，
+ * 所以要把它们单独认出来，而不是和 embedding 一起丢掉。
+ *
+ * 规则分两层（先认名字，认不出来再由主人手动标，见 imageOnly）：
+ *   1. 名字里带 image / 带已知画图系列 —— 最常见的一类
+ *   2. 上面都不沾，但名字里有 diffusion / 画图之类的强特征
+ */
+const IMAGE_PATTERNS: RegExp[] = [
+    // 名字里带 "image" 的基本都是画图：gpt-image-1、gemini-3.1-flash-image、
+    // qwen-image、seedream-image... 这是最省事也最不容易漏的一条
+    /image/i,
+    /dall-e/i,
+    /stable-diffusion/i,
+    /diffusion/i,
+    /sdxl/i,
+    /(^|[/_-])flux([/_-]|$)/i, // black-forest-labs/flux
+    /(^|[/_-])sd3([/_-]|$)/i,
+    /midjourney/i,
+    /(^|[/_-])imagen([/_-]|$)/i, // Google imagen
+    /(^|[/_-])kolors([/_-]|$)/i,
+    /(^|[/_-])seedream([/_-]|$)/i,
+    /(^|[/_-])wanx([/_-]|$)/i, // 通义万相
+    /(^|[/_-])cogview([/_-]|$)/i,
+    /(^|[/_-])playground-v2/i,
+    /(^|[/_-])pixart([/_-]|$)/i,
+    /(^|[/_-])hidream([/_-]|$)/i,
+];
+
+/** 名字里出现这些，说明是"看图"或"边说边画"的多模态，别当成纯画图 */
+const IMAGE_FALSE_POSITIVE = /chat|vision|vl([/_-]|$)/i;
+
+/** 这个名字看起来是不是画图模型 */
+export function isImageModel(name: string): boolean {
+    const n = String(name || "").trim();
+    if (!n) return false;
+    if (IMAGE_FALSE_POSITIVE.test(n)) return false;
+    return IMAGE_PATTERNS.some((re) => re.test(n));
+}
+
+/**
+ * 明显不能聊天、也不是画图的模型名。
+ *
+ * 中转站的 /models 会把 embedding、语音的模型混在一起，
  * 这些名字一旦被选中，发消息必然 400 —— 用户看到的就是
  * 「从接口拉来的不能用，自己手打一个就能用」。
  *
- * 名单刻意写窄：只挡铁定不能聊天的，宁可漏几个也别误杀能用的。
+ * 名单刻意写窄：只挡铁定不能用的，宁可漏几个也别误杀能用的。
  * 漏掉的顶多报一次错，误杀会让用户以为模型消失了。
  */
 const NON_CHAT_PATTERNS: RegExp[] = [
@@ -235,27 +332,59 @@ const NON_CHAT_PATTERNS: RegExp[] = [
     /(^|[/_-])tts([/_-]|$)/i, // tts-1
     /rerank/i,
     /moderation/i,
-    /dall-e/i,
-    /gpt-image/i,
-    /stable-diffusion/i,
-    /sdxl/i,
-    /(^|[/_-])flux([/_-]|$)/i, // black-forest-labs/flux
 ];
 
-/** 这个名字看起来能不能聊天 */
+/** 这个名字看起来能不能聊天（画图模型不算，见 isImageModel） */
 export function isChatModel(name: string): boolean {
     const n = String(name || "").trim();
     if (!n) return false;
+    if (isImageModel(n)) return false;
     return !NON_CHAT_PATTERNS.some((re) => re.test(n));
 }
 
-/** 把一批名字分成「能聊天的」和「跳过几个」，跳过的数量用于给用户一句人话 */
-export function splitChatModels(list: string[]): { chat: string[]; skipped: number } {
+/**
+ * 用户手动标成"这是画图模型"的名字（存在设置里）。
+ *
+ * 为什么必须留这条路：模型名千奇百怪，靠正则猜总会漏。
+ * 漏了的表现是"我明明配了画图模型，插件说没有" —— 这条兜底能救任何名字。
+ */
+export function isManualImage(name: string, manual: string[] | undefined): boolean {
+    const n = String(name || "").trim();
+    if (!n) return false;
+    return Array.isArray(manual) && manual.includes(n);
+}
+
+/** 综合判断：名字像画图，或者主人手动标过 */
+export function isImageModelOf(name: string, manual: string[] | undefined): boolean {
+    return isManualImage(name, manual) || isImageModel(name);
+}
+
+/** 综合判断能不能聊天：画图的不算（手动标过的也一样） */
+export function isChatModelOf(name: string, manual: string[] | undefined): boolean {
+    if (isManualImage(name, manual)) return false;
+    return isChatModel(name);
+}
+
+/**
+ * 拉回来的名字分三堆：能聊天的、能画图的、以及干脆没用的。
+ *
+ * 画图的和聊天的都要留下来 —— 一个进对话模式，一个进生图模式。
+ */
+export function splitChatModels(list: string[]): { chat: string[]; image: string[]; skipped: number } {
     const chat: string[] = [];
+    const image: string[] = [];
     let skipped = 0;
     for (const m of list) {
         if (isChatModel(m)) chat.push(m);
+        else if (isImageModel(m)) image.push(m);
         else skipped++;
     }
-    return { chat, skipped };
+    return { chat, image, skipped };
+}
+
+/** 下拉里给模型名配的一句人话注释（把手动标记的名单也算进来） */
+export function modelKindLabelOf(name: string, manual: string[] | undefined): string {
+    if (isImageModelOf(name, manual)) return "画图";
+    if (!isChatModelOf(name, manual)) return "不能聊天";
+    return "";
 }

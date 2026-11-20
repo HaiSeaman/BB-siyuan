@@ -1,31 +1,18 @@
-# AI Chat for SiYuan
+# SiYuan AI Chat + Image Panel
 
-An AI assistant panel for [SiYuan Note](https://b3log.org/siyuan/). Pick a prompt template, write your request, get a streamed answer, copy it back into your notes.
+An AI assistant panel for [SiYuan](https://b3log.org/siyuan/). It writes with you, and it **generates images** — saved automatically into the plugin's own folder.
 
-> **Read-only by design.** The plugin never inserts, edits, or overwrites your notes. Answers are shown in the panel and you copy them yourself. Nothing is written to your workspace without you.
+> **It never touches your notes.** The plugin never inserts, edits, or overwrites note content. Answers stay in the panel; you copy them out yourself. Generated images live only in the plugin's data folder.
 
-[中文说明](README.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING.md) · [Changelog](docs/CHANGELOG.md)
+[中文说明](README.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING.md) · [Changelog](docs/CHANGELOG.md) · [v1.4.0 release notes](docs/RELEASE-v1.4.0.md)
+
+Current version: **1.4.0**
 
 ---
 
-## Table of contents
+## Contents
 
-- [Features](#features)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Multiple APIs and models](#multiple-apis-and-models)
-- [Prompt templates](#prompt-templates)
-- [Copy and regenerate](#copy-and-regenerate)
-- [Thinking effort](#thinking-effort)
-- [MCP tools](#mcp-tools)
-- [Chat history](#chat-history)
-- [Mobile](#mobile)
-- [Providers and protocols](#providers-and-protocols)
-- [Configuration reference](#configuration-reference)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-- [Privacy and safety](#privacy-and-safety)
-- [Known limitations](#known-limitations)
+Features · Install · Quick start · Multiple APIs & multi-select models · Chat & prompts · Copy & resend · Thinking levels · Image generation · Image management · MCP tools · History · Mobile · Protocols · Configuration · Troubleshooting · Development · Privacy · Known limits
 
 ---
 
@@ -33,16 +20,21 @@ An AI assistant panel for [SiYuan Note](https://b3log.org/siyuan/). Pick a promp
 
 | Feature | What it does |
 |---|---|
-| **Prompt templates** | Save reusable system prompts. Tap one to apply it; every message in that conversation follows it. Built-in examples included. |
-| **Multiple APIs and models** | Keep several endpoints side by side (protocol + URL + key + model list). Switch from the top bar in one click. |
-| **Pull model lists** | Fetch the model list from your provider (`/models`). Non-chat models such as `embedding`, `whisper`, `tts` are filtered out and reported. |
-| **Streaming answers** | Token-by-token output on desktop, rendered as Markdown. |
-| **Copy / regenerate** | Copy your own message or an answer. Regenerate replaces the answer in place — no duplicate messages. |
-| **Thinking effort** | Six levels, translated per vendor (GLM, DeepSeek, GPT/o-series, Claude, Gemini, Kimi, Qwen, MiniMax). |
-| **MCP tools** | Connect MCP servers over HTTP, SSE, or a local command. Tools are passed to the model and called automatically. |
-| **Chat history** | Last 30 conversations saved automatically. Reopen, continue, delete one, or clear all. |
-| **Mobile support** | Works on Android / iOS SiYuan. Requests are relayed by the SiYuan kernel, so no CORS problems. |
-| **Friendly errors** | HTTP and model errors are translated into plain-language hints with a next step. |
+| **Prompt templates** | Save system prompts as templates; one click applies one. Three built-in examples. |
+| **Multiple APIs** | Several endpoints (protocol + base URL + key + model list) side by side; switch from the top bar. |
+| **Multi-select models per API** | Tick the models you actually use; the top bar lists only those. Click a name to switch. |
+| **Pull models from the endpoint** | Calls `/models`. Chat models and image models are listed separately; embedding/speech models are filtered out with a count. |
+| **Image generation** | A painting model puts the panel into image mode. Four size tiers, ten ratios, optional reference image (img2img). |
+| **Images saved to disk** | Written into the plugin's `images/` folder. Survives closing the panel and reopening history. |
+| **One-click image folder** | The **Images** button on the control bar opens the folder in your file manager. |
+| **One-click prompt polish** | A chat model rewrites your one-liner into a proper Chinese image prompt. |
+| **Streaming replies** | Character-by-character on desktop, rendered as Markdown. |
+| **Copy / resend** | Copy your message or the answer. Resend replaces the answer in place — no extra message. |
+| **Thinking levels** | Six levels, translated per vendor (GLM, DeepSeek, GPT/o, Claude, Gemini, Kimi, Qwen, MiniMax). |
+| **MCP tools** | HTTP, SSE, and local command transports. The model decides when to call a tool. |
+| **History** | Keeps the last 30 conversations; reopen, delete, or clear all. |
+| **Works on mobile** | Android/iOS SiYuan. Requests go through the SiYuan kernel, so no CORS problems. |
+| **Human-readable errors** | API and model errors are translated into plain advice. |
 
 ---
 
@@ -50,16 +42,16 @@ An AI assistant panel for [SiYuan Note](https://b3log.org/siyuan/). Pick a promp
 
 ### From the release zip
 
-1. Download `siyuan-plugin-ai-chat-v1.3.0.zip` from the release page.
-2. In SiYuan: **Settings → Marketplace → Downloaded → Plugins → Install from package**, choose the zip.
-3. Enable **AI 对话** and restart SiYuan.
+1. Download `siyuan-plugin-ai-chat-v1.4.0.zip`.
+2. In SiYuan: **Settings → Bazaar → Downloaded → Plugins → Install from package**, pick the zip.
+3. Enable "AI Chat" and restart SiYuan.
 
 ### Manual copy
 
-Extract the zip so that `plugin.json` sits directly inside the plugin folder:
+Unzip so that `plugin.json` sits directly in the plugin folder:
 
 ```
-<your-workspace>/data/plugins/siyuan-plugin-ai-chat/
+<your workspace>/data/plugins/siyuan-plugin-ai-chat/
 ├── plugin.json
 ├── index.js
 ├── index.css
@@ -67,179 +59,308 @@ Extract the zip so that `plugin.json` sits directly inside the plugin folder:
 └── net-proxy.cjs
 ```
 
-> `plugin.json` **must** be at the root of that folder, not one level deeper.
+> `plugin.json` **must** be at this level. One extra folder and SiYuan will not find the manifest.
 
 ### Requirements
 
 - SiYuan **3.8.5** or newer.
-- Desktop: Windows, macOS, or Linux.
-- Mobile: Android, iOS, or HarmonyOS.
+- Desktop: Windows / macOS / Linux.
+- Mobile: Android / iOS / HarmonyOS.
 
 ---
 
 ## Quick start
 
-1. Open the panel: click the **AI 生成** icon at the bottom of the right sidebar, use the top-bar plugin menu, or press `Alt+Ctrl+A`.
-2. Open **⚙ Settings → API and models**.
-3. Fill in one API card:
-   - **Protocol**: `OpenAI compatible` for most relay services.
-   - **Base URL**: e.g. `http://127.0.0.1:8080/v1`.
-   - **API key**: your key.
-   - **Model**: type a name, or click **Fetch from API**.
-4. Click **Test this API** — you should see the model reply.
-5. Back in the panel, type your request and press `Ctrl+Enter` (or click **Send**).
+### Chat
+
+1. Open the panel: the **AI Generate** icon at the bottom of the right dock, the top-bar plugin menu, or `Alt+Ctrl+A`.
+2. **⚙ Settings → APIs & models**, fill one API card: protocol `OpenAI compatible`, base URL (**must end with `/v1`**), key, model name.
+3. Click **Test this API**. If the model replies, you are set.
+4. Back in the panel: apply a template, type your request, press `Ctrl+Enter` or click **Send**.
+
+### Image generation
+
+1. Click the model name in the top bar, pick a model with the orange **image** tag (e.g. `gpt-image-1`, `gemini-3.1-flash-image`, `flux-schnell`).
+2. The panel switches to image mode: prompt bar and MCP bar collapse, Send becomes **Generate**.
+3. Describe the picture.
+4. Optional: **Upload** a reference image, pick a size and ratio, or click **Polish** to let a chat model rewrite your prompt.
+5. Click **Generate**. The result appears as a card with **Copy image** and **Save to computer**.
 
 ---
 
-## Multiple APIs and models
+## Multiple APIs & multi-select models
 
-Each **API card** holds one protocol, one base URL, one key, and its own list of models. Temperature, thinking level, and history length are global.
+Each **API card** holds one protocol, one base URL, one key, and its own model list. Temperature, thinking level, and history depth are global.
 
-- **+ Add API** creates another card.
-- **Set as current** makes that card active.
-- **Click a model name** to switch to it immediately. The top bar updates and a confirmation appears.
-- **×** removes one model.
-- **Clear other models** keeps the model currently selected and deletes the rest — handy after pulling dozens of models.
+### The checkbox: which models show in the top bar
 
-### Pulling a model list
+- **Ticked** = this model appears in the top bar switcher.
+- **Unticked** = dimmed in settings, hidden from the top bar, still kept in the list.
+- Tick as many as you like; clicking a name switches immediately.
+- **The model in use cannot be unticked** (the top bar would lose its label). Switch away first.
+- Old configs upgrade with everything ticked, so behaviour does not change.
 
-Click **Fetch from API**. The plugin calls the provider's model-list endpoint and merges the result into the current list.
+### Clearing un-ticked models
 
-Two rules worth knowing:
+**Clear other models** always keeps three groups:
 
-1. **Nothing is auto-selected.** Pulling only adds names. Relays often list `text-embedding-3-small` first; auto-selecting it would make the next request fail.
-2. **Obvious non-chat models are filtered** — `embedding`, `bge`, `whisper`, `tts`, `rerank`, `moderation`, `dall-e`, `gpt-image`, `stable-diffusion`, `sdxl`, `flux`. The result tells you how many were skipped. Models that merely look suspicious are shown dimmed instead of being removed.
+1. **Every model you ticked** (this is the fix — previously only the single active model survived, so ticking five left you with one).
+2. **Every image model** (needed for generation).
+3. **The model currently in use.**
 
-If your provider does not expose a model list, just type the model name.
+Only models that are neither ticked, nor image models, nor active get removed. The confirmation dialog names what will be kept.
+
+### Pulling the model list
+
+Click **Pull from endpoint**. Two rules:
+
+1. **It never auto-selects.** Pulling only adds names. The first entry from a relay is usually `text-embedding-3-small`; auto-selecting it guarantees a failed request.
+2. **Clearly unusable names are filtered** — `embedding`, `bge`, `whisper`, `tts`, `rerank`, `moderation`. Image models are **not** filtered; they stay with an "image" tag.
+
+### How models are classified
+
+| Class | How it is decided | How it looks |
+|---|---|---|
+| **Chat model** | Neither image-like nor embedding/speech | Normal |
+| **Image model** | Name contains `image`, or belongs to flux / sd / dall-e / imagen / seedream / wanx / cogview / midjourney | Orange chip with an "image" tag |
+| **Unusable** | Embedding, speech, rerank | Dashed grey, with a warning |
+
+**Multimodal models with `chat` / `vision` / `-vl` still count as chat** (`gpt-4o`, `qwen-vl-max`), so they are not misread as image models.
+
+**Fallback: manual marking.** Every model name has a small **Mark as image / ✓ image** button. Anything the name heuristic misses can be classified by hand, and every derived list updates immediately.
 
 ---
 
-## Prompt templates
+## Chat & prompts
 
-A template's body becomes the **system prompt** — the rules the model follows.
+A template's body becomes the **system prompt** — it tells the model who it is and how to write.
 
 | Variable | Meaning |
 |---|---|
-| `{{date}}` | Today's date, e.g. `2026-11-20` |
+| `{{date}}` | Today, e.g. `2026-11-20` |
 | `{{time}}` | Current time, e.g. `21:30` |
-| `{{weekday}}` | Day of the week |
-| `{{doc_title}}` | Title of the document open right now |
+| `{{weekday}}` | Weekday |
+| `{{doc_title}}` | Title of the open document |
 
 Notes:
 
-- **Tap to apply, not to send.** Tapping a template only binds the rules. You still write and send your own message.
-- **Applied templates persist** across every message in the conversation, including follow-ups, until you tap **Exit**.
-- **Single braces are not variables.** `{like this}` is sent to the model verbatim. Use double braces.
-- **Three built-in examples** are included and can be edited or deleted. Deleting all of them restores the defaults, so the list is never empty.
+- **Clicking a template applies it; it does not send.** Write and send yourself.
+- **It stays applied.** Every message in the conversation, including follow-ups, carries it until you click **Exit**.
+- **Single braces are not variables.** `{like this}` is sent verbatim. Variables need double braces.
+- **Three built-in examples**; edit or delete them. If all are deleted, defaults come back.
 
-### Right-click menu
+### Context menu
 
-Right-click anywhere in a note to find **AI 生成（open panel）** plus one entry per template. Choosing a template applies it and opens the panel — it does not send anything.
+Right-click anywhere in a note to see **AI Generate (open panel)** plus one entry per template. Clicking a template only applies it and opens the panel — **it does not send**.
 
 ---
 
-## Copy and regenerate
+## Copy & resend
 
-Both buttons appear under **your own** messages.
+Both buttons sit under **your own** messages.
 
 | Button | Behaviour |
 |---|---|
-| **Copy** | Copies the text of that message. Uses the Android native bridge on mobile, then `navigator.clipboard`, then `execCommand`. |
-| **Regenerate** | Re-asks the model with the same text and **replaces the existing answer in place**. |
+| **Copy** | Copies the text. On mobile it tries the Android bridge, then `navigator.clipboard`, then `execCommand`. |
+| **Resend** | Asks the same thing again and **replaces the existing answer in place**. |
 
-Regenerate does **not** add a new message pair. The conversation always holds exactly one "your message + answer" group for that question. The history sent to the model is truncated to everything *before* that message, so the model never sees its own previous answer.
+Resend **does not add** a message. History sent to the model stops **before** that message, so the model does not read its own previous answer.
 
-Regeneration uses the template that is **currently** bound, not the one used originally — useful when you have changed the rules and want the answer redone under them.
-
-Both buttons are disabled while a response is streaming.
+Both buttons are disabled while an answer is being generated.
 
 ---
 
-## Thinking effort
+## Thinking levels
 
-Six levels: **Off / Minimal / Low / Medium / High / Max**. The plugin translates them into whatever the selected model understands.
+Six levels: **off / minimal / low / medium / high / max**, translated per vendor.
 
-| Model family | What gets sent |
+| Family | What is sent |
 |---|---|
-| GLM | `low` / `high` / `max` (no medium, cannot truly disable) |
-| DeepSeek | `high` / `max` (v4 accepts `high` for lower levels) |
-| GPT / o-series | `minimal` / `low` / `medium` / `high` |
-| Claude (native) | `thinking.budget_tokens` + `effort` |
-| Claude (OpenAI-compatible) | `low` / `medium` / `high` |
+| GLM | `low` / `high` / `max` (no medium; cannot be disabled) |
+| DeepSeek | `high` / `max` |
+| GPT / o series | `minimal` / `low` / `medium` / `high` |
+| Claude native | `thinking.budget_tokens` + `effort` |
+| Claude via OpenAI | `low` / `medium` / `high` |
 | Gemini | `thinkingLevel`: `LOW` / `MEDIUM` / `HIGH` |
 | Kimi / Qwen / MiniMax | `minimal` / `low` / `medium` / `high` |
 
-If the model name is unrecognised, no thinking parameter is sent at all — that avoids `400` errors from strict gateways.
+If the model name is unrecognised, no thinking parameter is sent at all — better one missing feature than a hard 400.
 
-> **Measured behaviour:** on the author's relay, `glm-5.3` cannot fully disable thinking. `reasoning_effort=low` is the only value that suppresses the reasoning output. Even then the model sometimes emits reasoning anyway; that is the model's own behaviour. Turn off **Show reasoning** if you don't want to see it.
+---
+
+## Image generation
+
+### Sizes are screen resolutions
+
+**1K/2K/4K mean "which screen does this fill"**, not the "long edge 1024" convention.
+
+| Tier | Long edge | 16:9 | 1:1 | 9:16 | Fills |
+|---|---|---|---|---|---|
+| **1K** | 1920 | 1920×1080 | 1920×1920 | 1080×1920 | 1080p / typical laptop |
+| **2K** | 2560 | 2560×1440 | 2560×2560 | 1440×2560 | 2K monitor |
+| **4K** | 3840 | 3840×2160 | 3840×3840 | 2160×3840 | 4K monitor / TV |
+| **4K+** | 4096 | 4096×2304 | 4096×4096 | 2304×4096 | DCI 4K |
+
+The short edge follows the ratio and is rounded to a multiple of 8 (many models require it). The control bar always shows the final pixels.
+
+### Ten ratios
+
+1:1, 4:3, 3:4, 16:9, 9:16, 3:2, 2:3, 5:4, 4:5, 21:9.
+
+### A few models only accept fixed sizes
+
+| Model | Accepted sizes |
+|---|---|
+| `gpt-image-1` | 1024×1024, 1536×1024, 1024×1536 |
+| `dall-e-3` | 1024×1024, 1792×1024, 1024×1792 |
+| Others (Flux / SD / third-party relays) | Usually whatever you ask for |
+
+For those two official models the plugin picks the **closest ratio** and states it in orange on the control bar: "actual 1536 × 1024 (swapped)".
+
+> The official size table matches **exact official model names only**. Third-party names like `gpt-image-2.6-sunburst` are not restricted — they usually accept any size.
+
+### The four buttons above the input box
+
+| Button | What it does |
+|---|---|
+| **Images** | Opens the image folder in your file manager. On mobile it shows the path. |
+| **Upload** | Pick a local image (PNG / JPG / WEBP, up to 8 MB) as a reference; enables img2img. |
+| **Size** | 1K / 2K / 4K / 4K+; the menu shows the long edge. |
+| **Ratio** | Ten ratios. |
+| **Polish** | A **chat model** rewrites your text into a Chinese image prompt, replacing the input box content. |
+
+### Which model polishes the prompt
+
+Image models cannot write. Polishing always uses a **chat model**. The plugin remembers the last chat model you selected:
+
+- Even if the top bar is on an image model, **Polish** still uses that chat model.
+- If it was deleted, the first usable chat model is used instead.
+- **Models you manually marked as image models are never chosen.**
+- With no chat model at all, it says so plainly instead of sending a doomed request.
+
+### Limits
+
+- **OpenAI-compatible protocol only.** Claude native and Gemini native have no such image endpoint.
+- **The provider must support it.** Not every relay exposes `/images/generations`. A 404 usually means it is not enabled, or the base URL is missing `/v1`.
+- **One image per request.** `n=1` is fixed in the UI.
+- **Stop really stops.** Clicking Stop aborts the underlying request, not just the wait.
+
+---
+
+## Image management
+
+### Where images live
+
+```
+<workspace>\data\storage\petal\siyuan-plugin-ai-chat\images\
+```
+
+For example `Z:\siyuan\data\storage\petal\siyuan-plugin-ai-chat\images\img-20261120-162954-2048x1152.jpg`.
+
+The **Images** button on the control bar opens exactly this folder.
+
+### Why they are not stored in the session file
+
+A 4K image is over ten megabytes as base64. Inside `sessions.json` history would get slower with every picture until the panel could not open. So:
+
+- Images are separate files.
+- History stores only **path + size + prompt**.
+- Closing and reopening the panel, or reopening old history, still shows the images.
+- Deleting a conversation (or clearing all) also deletes its image files.
+
+### Image type comes from bytes, not the extension
+
+Providers sometimes hand back **JPEG bytes** inside a data URL that says `image/png`. Naming the file `.png` makes some SiYuan versions refuse to render a "declared type does not match content" image — the symptom is **copy and save work, but nothing shows**.
+
+Now the file header decides (`FF D8 FF` = JPEG, `89 50 4E 47` = PNG, `RIFF....WEBP` = WebP). Old mismatched files in history are renamed on open and their references updated.
+
+### Images embedded in the reply text
+
+Some providers (Gemini especially) return images mixed into the text:
+
+```text
+![image](data:image/jpeg;base64,...)
+```
+
+These are extracted into proper image cards, large ones are moved into `images/`, and the base64 is stripped from the message text. A 964 KB message shrinks back to normal.
+
+### The two buttons on an image card
+
+| Button | Behaviour |
+|---|---|
+| **Copy image** | Puts the image itself on the clipboard. Unsupported environments say so and suggest Save. |
+| **Save to computer** | Desktop shows the **native Save As** dialog (`<a download>` silently fails in Electron); mobile uses the system download. |
+
+### When an image cannot be read
+
+You never get a bare "not found". The reason is stated and a **Retry** button is provided:
+
+- folder not created yet (no image generated so far)
+- file read failed (mentions that other extensions were tried)
+- the provider's URL is unreachable
 
 ---
 
 ## MCP tools
 
-The plugin ships **no** MCP servers. You add your own.
+The plugin ships **no** MCP servers; add your own.
 
 ### Adding a server
 
-1. Open **MCP** from the panel.
-2. Click **+ Add HTTP** or **+ Add local command**.
-3. Fill in a name (the model uses it to tell tools apart) and the URL or command.
-4. Save and click **Test all servers**.
+1. Click **MCP** in the panel.
+2. **+ Add HTTP** or **+ Add local command**.
+3. Fill in a name plus a URL or command.
+4. Save, then **Test all servers**.
 
-| Type | What you fill in | Where it works |
+| Type | What to enter | Where it works |
 |---|---|---|
 | HTTP | URL, e.g. `http://127.0.0.1:3000/mcp` | Everywhere |
 | SSE (legacy) | URL | Everywhere |
 | Local command | Command + args, e.g. `npx` `-y @modelcontextprotocol/server-time` | Desktop only |
 
-A ready-made server to try:
-
-```text
-npx -y @modelcontextprotocol/server-everything
-```
-
 ### How the model uses tools
 
-Connected tools are added to the request's `tools` field. When the model decides to call one, the panel shows **"Calling tool: server / tool"**, sends the result back, and the model continues. A round limit (default 8) prevents infinite loops.
+Connected tools are sent in the request's `tools` field. When the model wants one, the panel shows "calling tool: server / tool name", feeds the result back, and the model continues. Rounds are capped (8 by default) to prevent loops.
 
-### Safety boundaries
+### Safety
 
-- Local commands are spawned **without a shell**; arguments are passed separately, so an injected `&` or `|` cannot execute.
-- Tools whose names contain `delete`, `write`, `update`, `remove`, `insert`, or `create` are flagged as write operations internally, but they are **still executed**. Only connect MCP servers you trust.
-- Each server connects independently; one failure does not break the others.
-- Tool names are sanitised to ASCII for the model and mapped back to the original name before execution.
+- Local commands **never use a shell**; arguments are passed separately, so injected `&` or `|` is inert.
+- Tools whose names contain `delete`, `write`, `update`, `remove`, `insert`, `create` are flagged as writes but **still execute**. Only connect servers you trust.
+- Each server connects independently; one failing does not affect the others.
 
 ---
 
-## Chat history
+## History
 
-Everything is saved automatically after each completed response.
+Saved automatically after every answer.
 
-- Up to **30** conversations, newest first.
-- Click a conversation to reopen and continue it.
-- **×** deletes one; **Clear all history** deletes every one after a confirmation.
-- Clearing also resets the conversation currently on screen — otherwise the next response would immediately save it again.
-- Identical content is not re-saved, so the list order does not jump around.
-- The bound template is **not** saved with the conversation. Re-apply it after switching back.
+- Up to **30** conversations, most recent first.
+- Click one to switch and continue.
+- **×** deletes one; **Clear all history** wipes everything after confirmation (including its image files).
+- Clearing also empties the conversation on screen — otherwise the next answer would save it again.
+- Unchanged content is not re-saved, so the list does not jump around.
+- Templates are **not** stored with a conversation; reapply after switching back.
 
 ---
 
 ## Mobile
 
-| Aspect | Desktop | Mobile |
+| Item | Desktop | Mobile |
 |---|---|---|
-| Request path | Plugin's Electron main-process proxy | SiYuan kernel relay (`/api/network/forwardProxy`) |
-| Rendering | Token-by-token streaming | Full answer appears at once |
-| Sending | `Ctrl+Enter` | Tap **Send** (soft keyboard send key also works) |
-| Model picker | Dropdown from the top bar | Bottom sheet |
-| Clipboard | `navigator.clipboard` | Android native bridge, then fallbacks |
-| Local MCP | Supported | Not available (no `require`) |
+| Request channel | Plugin's main-process proxy | SiYuan kernel forward (`/api/network/forwardProxy`) |
+| Streaming | Character by character | Whole answer at once |
+| Send | `Ctrl+Enter` | **Send** button (soft-keyboard send works) |
+| Model picker | Top-bar dropdown | Bottom sheet |
+| Clipboard | `navigator.clipboard` | Android bridge, several fallbacks |
+| Local MCP | Supported | Not supported (no `require`) |
+| Open image folder | Supported | Shows the path for a file manager |
+| Image generation | Supported | Supported (same kernel forward) |
 
-To make the panel easy to reach on mobile: **Settings → Appearance → Sidebar** and enable **AI 生成**.
+To make the panel easier to find: **Settings → Appearance → Sidebar**, enable **AI Generate**.
 
 ---
 
-## Providers and protocols
+## Protocols & providers
 
 | Protocol | Chat endpoint | Auth header |
 |---|---|---|
@@ -247,47 +368,59 @@ To make the panel easy to reach on mobile: **Settings → Appearance → Sidebar
 | Claude native | `{base}/v1/messages` | `x-api-key` + `anthropic-version` |
 | Gemini native | `{base}/v1beta/models/{model}:streamGenerateContent?alt=sse` | `x-goog-api-key` |
 
-For model lists: `{base}/models`, `{base}/v1/models`, `{base}/v1beta/models` respectively.
+Image generation is OpenAI-compatible only: `{base}/images/generations` (text to image) and `{base}/images/edits` (image to image).
 
-Any OpenAI-compatible gateway (relay services, Ollama, vLLM, LM Studio, one-api, etc.) works with the first protocol.
+Model list endpoints: `{base}/models`, `{base}/v1/models`, `{base}/v1beta/models`.
+
+> **The base URL must include `/v1`.** `https://api.example.com` yields 404 `Invalid URL`; `https://api.example.com/v1` works. The plugin appends `/images/generations` for you.
 
 ---
 
-## Configuration reference
+## Configuration
 
-### Per API card
+### Each API card
 
-| Field | Description |
+| Field | Meaning |
 |---|---|
-| Name | Display label, e.g. `Relay A` |
-| Protocol | `openai`, `anthropic`, or `gemini` |
-| Base URL | Endpoint root |
+| Name | Display label |
+| Protocol | `openai` / `anthropic` / `gemini` |
+| Base URL | Root URL, **ending in `/v1`** |
 | API key | Stored in plain text in the plugin data folder |
-| Models | List of model names for this endpoint |
-| Model | The currently selected model |
+| Model list | Model names available on this endpoint |
+| Ticks | Which ones appear in the top bar |
+| Current model | The one in use |
 
 ### Global preferences
 
-| Field | Default | Description |
+| Field | Default | Meaning |
 |---|---|---|
 | Temperature | `0.7` | Sampling temperature |
-| Max output tokens | `4096` | Upper bound for the answer |
-| Thinking | `high` | Thinking effort level |
-| Show reasoning | off | Display the model's reasoning block |
-| Context messages | `10` | How many past messages to send |
+| Max output tokens | `4096` | Answer length cap |
+| Thinking level | `high` | Thinking tier |
+| Show reasoning | off | Display the model's reasoning |
+| History depth | `10` | Messages carried into each request |
 | Context limit | `200000` | Token budget; `0` disables the check |
-| Max tool rounds | `8` | Tool-call iterations per turn |
+| Tool round cap | `8` | Tool calls per turn |
 
-### Where data is stored
+### Image preferences
 
-| File | Contents |
+| Field | Default | Meaning |
+|---|---|---|
+| Size | `2K` | 1K / 2K / 4K / 4K+ |
+| Ratio | `16:9` | Ten options |
+| Manual image list | empty | Force specific models to count as image models |
+
+### Where data lives
+
+| File / folder | Contents |
 |---|---|
-| `settings.json` | APIs, active API, global preferences |
+| `settings.json` | API configs, active API, global preferences |
 | `templates.json` | Prompt templates |
 | `mcp.json` | MCP server definitions |
-| `sessions.json` | Chat history |
+| `sessions.json` | History (image paths only, never image data) |
+| `images/` | Generated and absorbed image files |
 
-All of it lives under `<workspace>/data/storage/petal/siyuan-plugin-ai-chat/`. **Keys are stored unencrypted** — do not publish screenshots that show them.
+All under `<workspace>/data/storage/petal/siyuan-plugin-ai-chat/`. **Keys are stored in plain text** — do not publish screenshots containing them.
 
 ---
 
@@ -295,15 +428,17 @@ All of it lives under `<workspace>/data/storage/petal/siyuan-plugin-ai-chat/`. *
 
 | Message | Meaning |
 |---|---|
-| Invalid or expired API key | Check the key |
-| Endpoint not found | Check whether the base URL should end in `/v1` |
-| Request rejected (400) | Usually a wrong model name |
-| Provider error (500/502) | The provider's side — wait and retry |
-| Content too long | Start a new chat, or send a shorter message |
+| Key is wrong or expired | Check the API key |
+| Endpoint not found / `Invalid URL` | The base URL is missing `/v1` |
+| Rejected (400) | Usually a wrong model name |
+| Provider error (500/502) | Their side; retry in a few minutes |
+| Content too long | Start a new chat or shorten the input |
 | Local MCP program failed to start | Check the command and arguments |
-| Model not found | The name is not in the provider's list — pull the list again |
+| This model only supports fixed sizes, X replaced by Y | Expected; the model has a hard size table |
+| This image cannot be shown right now | The reason follows, with a Retry button |
+| Image folder not created yet | Generate one image first |
 
-If an error is not recognised, the original text is shown so you can search for it.
+Unrecognised errors keep the original text so you can search it.
 
 ---
 
@@ -311,16 +446,16 @@ If an error is not recognised, the original text is shown so you can search for 
 
 ```powershell
 npm install
-npm test                 # 841 assertions across 33 files
-npm run build            # build to dist/
+npm test                 # 1459 assertions across 49 files
+npm run build            # build into dist/
 npm run pack             # build + create the installable zip
 npm run install-plugin   # build + copy into your SiYuan workspace
 ```
 
-Useful extra commands:
+Two more handy commands:
 
 ```powershell
-npx svelte-check --tsconfig ./tsconfig.json   # type and template check
+npx svelte-check --tsconfig ./tsconfig.json   # types and templates
 node scripts/oneclick-pack.mjs                # build + pack in one step
 ```
 
@@ -328,50 +463,57 @@ node scripts/oneclick-pack.mjs                # build + pack in one step
 
 ```
 src/
-├── index.ts              plugin entry: dock, command, top bar, context menu
-├── net.ts                three request channels (native / kernel / fetch)
-├── providers.ts          three protocols: URLs, headers, bodies, stream parsing
-├── settings.ts           settings store + single debounced save path
-├── apis.ts               multi-API config, model list fetching and filtering
-├── thinking.ts           six thinking levels → per-vendor parameters
+├── index.ts              Entry: dock, command, top-bar button, context menu
+├── net.ts                Three request channels (main process / kernel / fetch)
+├── providers.ts          Three chat protocols: URL, headers, body, SSE parsing
+├── settings.ts           Settings store + the single debounced save path
+├── apis.ts               API configs, model pulling, classification
+├── thinking.ts           Six thinking levels → per-vendor parameters
+├── image.ts              Image sizing, request building, multipart, parsing
+├── image-store.ts        Save/load/delete images, open folder, magic-byte sniffing
+├── inline-image.ts       Extract markdown images from reply text
+├── optimize.ts           System prompt and cleanup for prompt polishing
+├── sessions.ts           History storage (images by path only)
 ├── template.ts           {{variable}} substitution
-├── templates.ts          template CRUD + built-in examples
-├── turnplan.ts           template + input + history → request messages
-├── tokens.ts             rough token estimate and length check
-├── sessions.ts           chat history storage
-├── errors.ts             error messages → plain language
-├── mcp-*.ts              MCP transports (JSON-RPC, HTTP, SSE, stdio, spawn, manager)
-├── tool-loop.ts          tool-call loop with a round limit
-└── ui/*.svelte           panel, settings, template manager, MCP settings
+├── templates.ts          Template CRUD + built-ins
+├── turnplan.ts           Template + input + history → request messages
+├── tokens.ts             Rough token estimate and length check
+├── errors.ts             Errors translated into plain language
+├── mcp-*.ts              MCP transports
+├── tool-loop.ts          Tool-call loop with a round cap
+└── ui/*.svelte           Panel, settings, template manager, MCP settings
 ```
 
-Everything under `src/*.ts` except `net.ts` and `index.ts` is pure logic: no DOM, no network. That is why most of it can be tested in plain Node.
+Every `src/*.ts` except `net.ts` and `index.ts` is pure logic: no DOM, no network. That is why they can be tested directly in Node.
 
 ---
 
-## Privacy and safety
+## Privacy & security
 
-- **No telemetry.** Nothing is sent anywhere except to the API endpoints you configure.
-- **Your keys stay local**, in the plugin data folder, unencrypted.
-- **No automatic writing.** The plugin never calls SiYuan's block-write APIs. You copy the text yourself.
-- **Local MCP is shell-free.** No `shell: true` anywhere; arguments are escaped for `cmd.exe` on Windows.
-
----
-
-## Known limitations
-
-- **GUI interactions are not covered by automated tests.** Clicks are verified headlessly (component mounted, events dispatched), but real-theme appearance must be checked by eye.
-- **Mobile has no streaming** — the kernel relay returns the full body at once. That is a SiYuan kernel limitation, not a plugin choice.
-- **Context length is estimated**, roughly one token per two characters. It is a warning system, not an exact count.
-- **No template import/export** yet.
-- **No OAuth for MCP servers** — static headers only.
-- **No conversation search** — the 30 most recent are listed.
-- **The non-chat model filter is deliberately narrow.** A missed name simply appears in the list and fails when used; a wrong match would hide a usable model.
+- **No telemetry.** Nothing leaves your machine except requests to the endpoint you configured.
+- **Keys stay local**, in plain text in the plugin data folder.
+- **Never writes to your notes.** The plugin does not call SiYuan's block-writing APIs.
+- **Image generation only writes into the plugin's own data folder.**
+- **Local MCP never goes through a shell.**
 
 ---
 
-## Credits
+## Known limits
 
-Built for personal use with SiYuan Note. Thanks to the SiYuan team for a plugin API that makes this possible.
+- **No GUI automation for the interface.** Clicks are verified headlessly (a real mount plus dispatched events); visual polish still needs your eyes.
+- **No streaming on mobile.** The kernel forward returns the whole answer at once.
+- **Image generation is OpenAI-compatible only.**
+- **One image per request.**
+- **Token counts are estimates**, roughly two characters per token. A warning, not an exact meter.
+- **No template import/export.**
+- **No OAuth for MCP servers**; static headers only.
+- **No conversation search** — just the last 30.
+- **Model classification is name-based**; unusual names may be misread. Use **Mark as image** in settings to correct it.
 
-License: not published — this is a personal project.
+---
+
+## Notes
+
+Built for personal use. Thanks to the SiYuan team for a plugin API that is genuinely pleasant to work with.
+
+License: unpublished — a personal project.

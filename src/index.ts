@@ -70,6 +70,8 @@ export default class AIChatPlugin extends Plugin {
                         persistMcpServers: persistMcp,
                         initialSessions: sessions,
                         persistSessions,
+                        // 图片要存在插件自己的数据目录里，面板得知道自己的目录名
+                        pluginName: this.name,
                     },
                 });
             },

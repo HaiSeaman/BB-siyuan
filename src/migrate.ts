@@ -84,5 +84,18 @@ export function migrateSettings(raw: any): Partial<Settings> | null {
         out.maxToolRounds = Math.min(30, Math.max(1, Math.round(out.maxToolRounds)));
     }
 
+    // 手动标记的画图模型名单：老版本没这个字段，洗成数组即可
+    if (Array.isArray(out.imageModels)) {
+        out.imageModels = out.imageModels.filter((m: unknown): m is string => typeof m === "string" && !!m.trim());
+    } else {
+        out.imageModels = [];
+    }
+
+    // 生图参数：只认这三档 / 这几种比例，野值退回默认
+    if (!["1K", "2K", "4K", "4K+"].includes(out.imageSize)) out.imageSize = "2K";
+    if (!["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "5:4", "4:5", "21:9"].includes(out.imageRatio)) {
+        out.imageRatio = "16:9";
+    }
+
     return out;
 }

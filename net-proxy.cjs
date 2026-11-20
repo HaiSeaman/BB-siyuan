@@ -81,7 +81,13 @@ exports.startRequest = function startRequest(options, onEvent) {
         for (const [key, value] of Object.entries(options.headers || {})) {
             request.setHeader(key, String(value));
         }
-        request.end(options.body || undefined);
+        // 二进制请求体（图生图的 multipart）走 bodyBase64。
+        // 不能直接用 options.body：字符串会被当 UTF-8 再转一次，图片字节就坏了。
+        if (typeof options.bodyBase64 === "string" && options.bodyBase64) {
+            request.end(Buffer.from(options.bodyBase64, 'base64'));
+        } else {
+            request.end(options.body || undefined);
+        }
     } catch (error) {
         fail(error);
     }

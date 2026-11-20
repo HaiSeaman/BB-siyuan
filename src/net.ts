@@ -8,6 +8,9 @@
  * 才一次性回来（桌面端是逐字显示）。
  */
 
+// 字节转 base64 统一由 image-store 提供，避免两处各写一套分块循环
+import { bytesToBase64 } from "./image-store";
+
 export interface ChatMessage {
     role: "system" | "user" | "assistant";
     content: string;
@@ -29,7 +32,15 @@ export interface RequestHandle {
 
 interface ElectronBridge {
     startRequest: (
-        options: { url: string; method?: string; headers?: Record<string, string>; body?: string; owner: any },
+        options: {
+            url: string;
+            method?: string;
+            headers?: Record<string, string>;
+            body?: string;
+            /** 二进制请求体（base64）。与 body 二选一 */
+            bodyBase64?: string;
+            owner: any;
+        },
         onEvent: (type: string, value: any) => void
     ) => RequestHandle;
 }
@@ -153,24 +164,36 @@ async function kernelForward(opts: {
     body?: string;
     timeoutMs?: number;
     signal?: AbortSignal;
+    /** 二进制请求体（图生图的 multipart 就是二进制）。给了它就不看 body */
+    rawBody?: Uint8Array;
 }): Promise<ForwardResult> {
     const headers = opts.headers || {};
     // 内核要的是「一个键一个对象的数组」，不能直接给对象
     const headerList = Object.keys(headers).map((k) => ({ [k]: String(headers[k]) }));
 
     let payload: any = undefined;
-    if (typeof opts.body === "string" && opts.body) {
+    let payloadEncoding = "json";
+
+    if (opts.rawBody && opts.rawBody.length) {
+        // 二进制原样交给内核：内核认 base64，decode 后按字节发出去。
+        // 这条是图生图（multipart/form-data）唯一的走法 ——
+        // 内核的 text/json 分支都会把字节改坏，图片必然解析失败。
+        payload = bytesToBase64(opts.rawBody);
+        payloadEncoding = "base64";
+    } else if (typeof opts.body === "string" && opts.body) {
         try {
             payload = JSON.parse(opts.body);
+            payloadEncoding = "json";
         } catch {
             // 不是 JSON 就原样当字符串交过去
             payload = opts.body;
+            payloadEncoding = "text";
         }
     }
 
     // 没有 body 时必须用 text 编码：内核在 json 编码下会把空载荷写成 "null"，
     // 那样 GET / DELETE 会带着四个字符的 body 发出去，部分服务端会直接报错。
-    const hasBody = typeof opts.body === "string" && opts.body.length > 0;
+    const hasBody = payloadEncoding === "base64" || (typeof opts.body === "string" && opts.body.length > 0);
 
     const resp = await fetch("/api/network/forwardProxy", {
         method: "POST",
@@ -183,7 +206,7 @@ async function kernelForward(opts: {
             contentType: headers["Content-Type"] || headers["content-type"] || "application/json",
             headers: headerList,
             payload: hasBody ? payload : "",
-            payloadEncoding: hasBody ? "json" : "text",
+            payloadEncoding: hasBody ? payloadEncoding : "text",
         }),
     });
 
@@ -217,7 +240,7 @@ async function kernelForward(opts: {
  */
 export async function fetchOnce(
     url: string,
-    opts: { method: string; headers: Record<string, string>; body?: string }
+    opts: { method: string; headers: Record<string, string>; body?: string; timeoutMs?: number }
 ): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: () => Promise<string> }> {
     const channel = currentChannel();
 
@@ -232,7 +255,7 @@ export async function fetchOnce(
             method: opts.method,
             headers: opts.headers,
             body: opts.body,
-            timeoutMs: 60000,
+            timeoutMs: opts.timeoutMs ?? 60000,
         });
         const headers = new Map<string, string>();
         if (r.contentType) headers.set("content-type", r.contentType);
@@ -255,11 +278,106 @@ export async function fetchOnce(
     return { ok: resp.ok, status: resp.status, headers, text: async () => text };
 }
 
-function fetchOnceViaNative(
+
+
+export interface BinaryResponse {
+    ok: boolean;
+    status: number;
+    headers: Map<string, string>;
+    text: () => Promise<string>;
+    bytes: () => Promise<Uint8Array>;
+}
+
+/**
+ * 要二进制响应的请求（生图用）。
+ *
+ * 为什么不复用 fetchOnce：它只能拿文本，图片要是被当成文本读一遍，
+ * 字节就废了。这里统一返回字节，再由上层决定怎么用。
+ *
+ * 三条通道都能发二进制请求体（图生图的 multipart）：
+ *   电脑 → 主进程直接把 Buffer 交过去
+ *   手机 → 内核转发，用 base64 编码送（内核解回来后按字节发）
+ *   兜底 → 浏览器 fetch
+ */
+export async function fetchBinary(
+    url: string,
+    opts: {
+        method: string;
+        headers: Record<string, string>;
+        body?: string;
+        rawBody?: Uint8Array;
+        timeoutMs?: number;
+        /** 中止信号：用户点「停止」时真正掐断请求，而不是只让上层不等了 */
+        signal?: AbortSignal;
+    }
+): Promise<BinaryResponse> {
+    const channel = currentChannel();
+
+    if (channel === "native") {
+        const native = loadBridge();
+        if (native) return fetchBinaryViaNative(native, url, opts);
+    }
+    // 已经中止了就别再发包
+    if (opts.signal?.aborted) throw new Error("已停止");
+
+    if (channel === "kernel") {
+        const r = await kernelForward({
+            url,
+            method: opts.method,
+            headers: opts.headers,
+            body: opts.body,
+            rawBody: opts.rawBody,
+            // 生图慢：4K 一两分钟很常见，别按 MCP 那套 60 秒算
+            timeoutMs: opts.timeoutMs ?? 300000,
+            signal: opts.signal,
+        });
+        const headers = new Map<string, string>();
+        if (r.contentType) headers.set("content-type", r.contentType);
+        const bytes = new TextEncoder().encode(r.text || "");
+        return {
+            ok: r.status >= 200 && r.status < 300,
+            status: r.status,
+            headers,
+            text: async () => r.text || "",
+            bytes: async () => bytes,
+        };
+    }
+
+    const resp = await fetch(url, {
+        method: opts.method,
+        headers: opts.headers,
+        body: (opts.rawBody as any) || opts.body,
+        signal: opts.signal,
+    });
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    const headers = new Map<string, string>();
+    resp.headers.forEach((v, k) => headers.set(k.toLowerCase(), v));
+    return {
+        ok: resp.ok,
+        status: resp.status,
+        headers,
+        text: async () => new TextDecoder().decode(buf),
+        bytes: async () => buf,
+    };
+}
+
+/**
+ * 桌面端（Electron 主进程）发一次请求。
+ *
+ * 合并了原来 fetchOnceViaNative / fetchBinaryViaNative 两份几乎一样的实现：
+ * 它们唯一的区别是返回 text 还是 bytes，这里用返回值形态统一处理。
+ *
+ * 行为与原实现完全一致：
+ *   - settled 防重入：response/data/end/error 只认第一次
+ *   - 正常结束清掉兜底超时，避免闭包多持有定时器
+ *   - 超时时 abort 底层请求，避免后台还在拉数据
+ */
+function runNativeRequest(
     native: { bridge: ElectronBridge; owner: any },
     url: string,
-    opts: { method: string; headers: Record<string, string>; body?: string }
-): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: () => Promise<string> }> {
+    opts: { method: string; headers: Record<string, string>; body?: string; rawBody?: Uint8Array; signal?: AbortSignal },
+    timeoutMs: number
+): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: string }> {
     return new Promise((resolve, reject) => {
         let chunks: string[] = [];
         let statusCode = 0;
@@ -271,15 +389,14 @@ function fetchOnceViaNative(
         const finish = (err?: string) => {
             if (settled) return;
             settled = true;
-            // 正常结束也要清掉兜底超时，否则闭包会多持有 60 秒
+            // 正常结束也要清掉兜底超时，否则闭包会多持有定时器
             if (timeoutTimer) clearTimeout(timeoutTimer);
             if (err) return reject(new Error(err));
-            const body = chunks.join("");
             resolve({
                 ok: statusCode >= 200 && statusCode < 300,
                 status: statusCode,
                 headers,
-                text: async () => body,
+                text: chunks.join(""),
             });
         };
 
@@ -288,7 +405,8 @@ function fetchOnceViaNative(
                 url,
                 method: opts.method,
                 headers: opts.headers,
-                body: opts.body,
+                body: opts.rawBody ? undefined : opts.body,
+                bodyBase64: opts.rawBody && opts.rawBody.length ? bytesToBase64(opts.rawBody) : undefined,
                 owner: native.owner,
             },
             (type, value) => {
@@ -309,7 +427,6 @@ function fetchOnceViaNative(
             }
         );
 
-        // 兜底：MCP 请求不该无限等
         timeoutTimer = setTimeout(() => {
             if (settled) return;
             settled = true;
@@ -317,8 +434,56 @@ function fetchOnceViaNative(
                 handle?.abort();
             } catch {}
             reject(new Error("请求超时"));
-        }, 60000);
+        }, timeoutMs);
+
+        // 用户点「停止」时真正掐断底层请求，别让他等满超时
+        const sig = opts.signal;
+        if (sig) {
+            const onAbort = () => {
+                if (settled) return;
+                settled = true;
+                if (timeoutTimer) clearTimeout(timeoutTimer);
+                try {
+                    handle?.abort();
+                } catch {}
+                reject(new Error("已停止"));
+            };
+            if (sig.aborted) return onAbort();
+            sig.addEventListener("abort", onAbort, { once: true });
+        }
     });
+}
+
+/** MCP 用的「一次要完整响应」：桌面端走主进程，超时 60 秒 */
+function fetchOnceViaNative(
+    native: { bridge: ElectronBridge; owner: any },
+    url: string,
+    opts: { method: string; headers: Record<string, string>; body?: string; timeoutMs?: number }
+): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: () => Promise<string> }> {
+    // 用调用方给的超时；没给才退回 60 秒
+    return runNativeRequest(native, url, opts, opts.timeoutMs ?? 60000).then((r) => ({
+        ok: r.ok,
+        status: r.status,
+        headers: r.headers,
+        text: async () => r.text,
+    }));
+}
+
+/** 生图用：桌面端走主进程，超时按调用方给的（默认 5 分钟，4K 很慢） */
+function fetchBinaryViaNative(
+    native: { bridge: ElectronBridge; owner: any },
+    url: string,
+    opts: { method: string; headers: Record<string, string>; body?: string; rawBody?: Uint8Array; timeoutMs?: number; signal?: AbortSignal }
+): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: () => Promise<string>; bytes: () => Promise<Uint8Array> }> {
+    return runNativeRequest(native, url, opts, opts.timeoutMs ?? 300000).then((r) => ({
+        ok: r.ok,
+        status: r.status,
+        headers: r.headers,
+        text: async () => r.text,
+        // 主进程那条通道回传的是文本；图片本来就以 base64 JSON 回来，
+        // 所以这里把文本重新编成字节，交给上层统一处理
+        bytes: async () => new TextEncoder().encode(r.text),
+    }));
 }
 
 /** 发起请求；返回的对象可用来中止 */
@@ -405,9 +570,18 @@ function streamViaNative(
         } catch {}
     };
 
+    // 兜底超时：另外两条通道都有超时，唯独这条没有 ——
+    // 服务端连上却不发数据时会把界面永远卡在"正在生成"。
+    // 5 分钟远长于正常回答，不会误伤；真卡住时至少能给出提示。
+    const idleTimer = setTimeout(() => {
+        finish("等太久了没有收到任何数据。可能是网络断了，或者服务端卡住。", 0);
+    }, 300000);
+
     const finish = (err?: string, code?: number) => {
         if (settled) return;
         settled = true;
+        // 无论成败都清掉兜底定时器，否则闭包会多持有 5 分钟
+        clearTimeout(idleTimer);
         // 出错时把底层请求也掐掉，不然它还在后台拉数据
         if (err) stopUnderlying();
         handlers.onEnd(err, code);

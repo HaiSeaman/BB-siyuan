@@ -1,12 +1,17 @@
 <script lang="ts">
-    import { settings, updateSettings, updateSettingsWith, type Settings } from "../settings";
+    import { settings, updateSettings, updateSettingsWith, packModelRef, type Settings } from "../settings";
     import { endpointFor, headersFor, bodyFor, ProviderParser, type Protocol } from "../providers";
     import { THINKING_LEVELS, supportsThinking, type ThinkingLevel } from "../thinking";
     import { streamChat, fetchOnce } from "../net";
     import {
         createApi,
+        togglePick,
+        isPicked,
         fetchModels,
         isChatModel,
+        isChatModelOf,
+        isImageModel,
+        isImageModelOf,
         mergeModels,
         type ApiConfig,
     } from "../apis";
@@ -120,12 +125,83 @@
                 model: api.model || text,
             };
         });
+        testResult = { ...testResult, [id]: addModelHint(text) };
     }
 
-    /** 删模型后该留哪个当当前模型：能聊天的最合适，一个都没有就留空 */
+    /** 手动添加也能标出用途，加完给一句人话 */
+    function addModelHint(text: string): string {
+        if (isImageModel(text)) return `已加入画图模型：${text}。在面板里选它就会进生图模式。`;
+        if (!isChatModel(text)) return `已加入：${text}。注意这个名字看起来不能聊天，也不能生图。`;
+        return `已加入聊天模型：${text}`;
+    }
+
+    /** 手动标成"这是画图模型"的名单。名字判断一定会漏，这是兜底 */
+    $: manualImage = Array.isArray($settings?.imageModels) ? $settings.imageModels : [];
+
+    /** 把某个模型标记/取消标记成画图模型 */
+    function toggleManualImage(apiId: string, name: string) {
+        const on = manualImage.includes(name);
+        updateSettingsWith(
+            (s) => {
+                const list = (Array.isArray(s.imageModels) ? s.imageModels : []).filter((m) => m !== name);
+                if (!on) list.push(name);
+                return { ...s, imageModels: list };
+            },
+            (s) => persist(s)
+        );
+        testResult = {
+            ...testResult,
+            [apiId]: on
+                ? `已取消标记「${name}」`
+                : `已把「${name}」标成画图模型。回到面板点「🎨 生图」就能用它。`,
+        };
+    }
+
+    /** 这个名字（综合手动标记）是不是画图模型 */
+    function isImg(m: string): boolean {
+        return isImageModelOf(m, manualImage);
+    }
+    /** 这个名字（综合手动标记）能不能聊天 */
+    function isChat(m: string): boolean {
+        return isChatModelOf(m, manualImage);
+    }
+
+    /** 勾选/取消一个模型（多选，出现在顶栏的切换列表里） */
+    function pickToggle(apiId: string, name: string) {
+        updateSettingsWith(
+            (st) => {
+                const target = st.apis.find((a) => a.id === apiId);
+                if (!target) return st;
+                const next = togglePick(target, name);
+                if (next === target) {
+                    testResult = { ...testResult, [apiId]: `「${name}」正在用，不能取消勾选。先切到别的模型。` };
+                    return st;
+                }
+                const apis = st.apis.map((a) => (a.id === apiId ? next : a));
+                return { ...st, apis };
+            },
+            (x) => persist(x)
+        );
+    }
+
+    /** 删模型后该留哪个当当前模型：能聊天的最合适，其次画图的，一个都没有就留空 */
     function fallbackModel(models: string[]): string {
-        const usable = models.find((m) => isChatModel(m));
-        return usable || models[0] || "";
+        const usable = models.find((m) => isChatModelOf(m, manualImage));
+        if (usable) return usable;
+        const drawable = models.find((m) => isImageModelOf(m, manualImage));
+        if (drawable) return drawable;
+        return models[0] || "";
+    }
+
+    /** 卡片里的模型按用途分成三组，界面上一眼能分清 */
+    function chatModelsOf(api: ApiConfig): string[] {
+        return (api?.models || []).filter((m) => isChat(m));
+    }
+    function imageModelsOf(api: ApiConfig): string[] {
+        return (api?.models || []).filter((m) => isImg(m));
+    }
+    function deadModelsOf(api: ApiConfig): string[] {
+        return (api?.models || []).filter((m) => !isChat(m) && !isImg(m));
     }
 
     function removeModel(id: string, model: string) {
@@ -142,13 +218,19 @@
      *
      * 以前只改了 model 字段，activeApiId 没动：在 B 卡片点模型，
      * 顶栏还显示 A 的模型，发出去的还是 A 的模型，用户看到的就是「点了没反应」。
+     *
+     * 另外：点到能聊天的模型时，顺手记一笔「上次用的聊天模型」，
+     * 之后切到画图模型了，「优化提示词」还能找回它。
      */
     function pickModel(id: string, model: string) {
+        const chatty = isChatModel(model);
         updateSettingsWith(
             (s) => {
                 if (!s.apis.some((a) => a.id === id)) return s;
                 const apis = s.apis.map((a) => (a.id === id ? { ...a, model } : a));
-                return { ...s, apis, activeApiId: id };
+                const next: any = { ...s, apis, activeApiId: id };
+                if (chatty) next.lastChatModel = packModelRef(id, model);
+                return next;
             },
             (s) => persist(s)
         );
@@ -156,6 +238,8 @@
             ...testResult,
             [id]: busy
                 ? `已切到 ${model}。这一轮已经发出去了，下一轮生效。`
+                : isImageModel(model)
+                ? `已切到 ${model}。这是画图模型，在面板里会进入生图模式。`
                 : `已切到 ${model}。点「测试这个 API」可以验证它能不能用。`,
         };
     }
@@ -165,6 +249,19 @@
      *
      * 主人在一堆拉回来的模型里挑好了一个，其余的都是噪音；
      * 全清光会把选中的也删掉，等于白挑一次。
+     *
+     * 但画图模型不能跟着被清掉：生图功能要靠它们，
+     * 清完只剩一个聊天模型，主人会发现「生图模式没模型可选了」。
+     */
+    /**
+     * 清除没勾选的模型。
+     *
+     * 保留三类（只要沾到一个就不删）：
+     *   1. 勾选过的（picked）—— 主人自己挑出来的，绝不能动
+     *   2. 画图模型 —— 生图要用
+     *   3. 当前正在用的那个
+     *
+     * 以前只保留后两类，导致"勾了 5 个，点清除只剩 1 个"。
      */
     function clearModels(id: string) {
         const api = $settings.apis.find((a) => a.id === id);
@@ -173,19 +270,42 @@
             testResult = { ...testResult, [id]: "这套 API 本来就没有模型" };
             return;
         }
-        if (!api?.model) {
-            testResult = { ...testResult, [id]: "还没选中模型，先点一个模型名再清除" };
-            return;
-        }
-        const keep = api.model;
-        const drop = all.length - 1;
+
+        // 勾选的（老对象没有 picked 时按"全选"处理，此时没有可清除的）
+        const pickedList = Array.isArray(api?.picked) ? api.picked : all;
+        const keepSet = new Set<string>([
+            ...pickedList,
+            ...all.filter((m) => isImageModel(m)),
+        ]);
+        if (api?.model) keepSet.add(api.model);
+
+        const drop = all.length - keepSet.size;
         if (drop <= 0) {
-            testResult = { ...testResult, [id]: "只剩当前选中的这一个，没有可清除的" };
+            testResult = {
+                ...testResult,
+                [id]: "所有模型都被勾选/在用/是画图模型，没有可清除的",
+            };
             return;
         }
-        if (!confirm(`清除另外 ${drop} 个模型，只留当前选中的「${keep}」？`)) return;
-        updateApiWith(id, () => ({ models: [keep], model: keep }));
-        testResult = { ...testResult, [id]: `已清除 ${drop} 个，只留当前选中的「${keep}」` };
+
+        const keptPicked = pickedList.filter((m) => all.includes(m)).length;
+        const keptImage = all.filter((m) => isImageModel(m) && !pickedList.includes(m)).length;
+        const parts: string[] = [];
+        if (keptPicked) parts.push(`勾选的 ${keptPicked} 个`);
+        if (keptImage) parts.push(`画图模型 ${keptImage} 个`);
+        const tail = parts.length ? `（保留：${parts.join("、")}）` : "";
+
+        if (!confirm(`清除 ${drop} 个没勾选的模型${tail}？`)) return;
+
+        const nextModels = all.filter((m) => keepSet.has(m));
+        const nextPicked = pickedList.filter((m) => nextModels.includes(m));
+        updateApiWith(id, () => ({
+            models: nextModels,
+            picked: nextPicked,
+            // 当前模型一定还在（上面已经加进 keepSet）
+            model: api?.model && nextModels.includes(api.model) ? api.model : nextModels[0] || "",
+        }));
+        testResult = { ...testResult, [id]: `已清除 ${drop} 个没勾选的${tail}` };
     }
 
     function patch(p: Partial<Settings>) {
@@ -216,6 +336,9 @@
      *
      * 只往清单里加，绝不自动选中：中转站的清单头一个常是 embedding，
      * 自动选上就会发一次必失败的请求，用户以为是「拉来的不能用」。
+     *
+     * 画图模型也会一起拉进来（以前是被当垃圾丢掉的），
+     * 主人要拿它们生图，丢了等于生图功能没入口。
      */
     async function pullModels(api: ApiConfig) {
         if (pulling[api.id]) return;
@@ -227,21 +350,23 @@
                 testResult = { ...testResult, [api.id]: "拉取失败：" + r.error };
                 return;
             }
+            const incoming = [...r.models, ...r.imageModels];
             let added = 0;
             updateApiWith(api.id, (current) => {
-                const merged = mergeModels(current.models, r.models);
+                const merged = mergeModels(current.models, incoming);
                 added = merged.length - current.models.length;
                 // 一个模型都没有时才顺手选第一个能聊天的；已经选过就不动它
-                const model = current.model || fallbackModel(r.models);
+                const model = current.model || fallbackModel(r.models.length ? r.models : incoming);
                 return { models: merged, model };
             });
-            const skippedNote = r.skipped ? `，另有 ${r.skipped} 个不能聊天的已跳过` : "";
+            const skippedNote = r.skipped ? `，另有 ${r.skipped} 个不能用的已跳过` : "";
+            const imageNote = r.imageModels.length ? `，其中 ${r.imageModels.length} 个是画图模型` : "";
             const nextNote = added
                 ? "。点模型名选用，再点「测试这个 API」验证"
                 : "。这些之前都拉过了，点模型名选用";
             testResult = {
                 ...testResult,
-                [api.id]: `拉到 ${r.models.length} 个模型（新增 ${added} 个）${skippedNote}${nextNote}`,
+                [api.id]: `拉到 ${incoming.length} 个模型（新增 ${added} 个）${imageNote}${skippedNote}${nextNote}`,
             };
         } finally {
             pulling = { ...pulling, [api.id]: false };
@@ -383,25 +508,91 @@
                             </button>
                         {/if}
                     </div>
-                    <div class="model-list">
-                        {#each api.models as m}
-                            <span class="model-chip" class:active={api.model === m} class:bad={!isChatModel(m)}>
-                                <button
-                                    class="chip-name"
-                                    on:click={() => pickModel(api.id, m)}
-                                    title="点一下，切换到这个模型"
-                                >{m}</button>
-                                <button class="chip-x" on:click={() => removeModel(api.id, m)} title="删掉这个模型">×</button>
-                            </span>
-                        {/each}
-                        {#if api.models.length === 0}
-                            <span class="none">还没有模型</span>
-                        {/if}
-                    </div>
+                    {#if chatModelsOf(api).length}
+                        <div class="group-label">聊天模型 <em>（优化提示词也用这一组）</em></div>
+                        <div class="model-list">
+                            {#each chatModelsOf(api) as m}
+                                <span class="model-chip" class:active={api.model === m} class:unpicked={!isPicked(api, m)}>
+                                    <button
+                                        class="chip-pick"
+                                        class:on={isPicked(api, m)}
+                                        on:click={() => pickToggle(api.id, m)}
+                                        title={isPicked(api, m) ? "已勾选：会出现在顶栏的切换列表里。点一下取消" : "点一下勾选，它就会出现在顶栏的切换列表里"}
+                                    >{isPicked(api, m) ? "✓" : ""}</button>
+                                    <button
+                                        class="chip-name"
+                                        on:click={() => pickModel(api.id, m)}
+                                        title="点一下，切换到这个模型"
+                                    >{m}</button>
+                                    <button
+                                        class="chip-mark"
+                                        on:click={() => toggleManualImage(api.id, m)}
+                                        title={manualImage.includes(m) ? "取消「画图」标记，改回当聊天模型" : "它其实是画图模型？点这里标记"}
+                                    >{manualImage.includes(m) ? "✓画图" : "标为画图"}</button>
+                                    <button class="chip-x" on:click={() => removeModel(api.id, m)} title="删掉这个模型">×</button>
+                                </span>
+                            {/each}
+                        </div>
+                    {/if}
+                    {#if imageModelsOf(api).length}
+                        <div class="group-label image">画图模型 <em>（在面板里选它就会切到生图模式）</em></div>
+                        <div class="model-list">
+                            {#each imageModelsOf(api) as m}
+                                <span class="model-chip image" class:active={api.model === m} class:unpicked={!isPicked(api, m)}>
+                                    <button
+                                        class="chip-pick"
+                                        class:on={isPicked(api, m)}
+                                        on:click={() => pickToggle(api.id, m)}
+                                        title={isPicked(api, m) ? "已勾选：会出现在顶栏的切换列表里。点一下取消" : "点一下勾选，它就会出现在顶栏的切换列表里"}
+                                    >{isPicked(api, m) ? "✓" : ""}</button>
+                                    <button
+                                        class="chip-name"
+                                        on:click={() => pickModel(api.id, m)}
+                                        title="点一下，切换到这个画图模型"
+                                    >{m}</button>
+                                    <button
+                                        class="chip-mark"
+                                        on:click={() => toggleManualImage(api.id, m)}
+                                        title={manualImage.includes(m) ? "取消「画图」标记" : "它本来就是画图模型（名字认出来的），也能手动标记"}
+                                    >{manualImage.includes(m) ? "✓画图" : "画图"}</button>
+                                    <button class="chip-x" on:click={() => removeModel(api.id, m)} title="删掉这个模型">×</button>
+                                </span>
+                            {/each}
+                        </div>
+                    {/if}
+                    {#if deadModelsOf(api).length}
+                        <div class="group-label dead">用不了的模型 <em>（嵌入、语音这类，选了一发就报错）</em></div>
+                        <div class="model-list">
+                            {#each deadModelsOf(api) as m}
+                                <span class="model-chip bad" class:active={api.model === m}>
+                                    <button
+                                        class="chip-pick"
+                                        class:on={isPicked(api, m)}
+                                        on:click={() => pickToggle(api.id, m)}
+                                        title="勾选后也会出现在顶栏"
+                                    >{isPicked(api, m) ? "✓" : ""}</button>
+                                    <button
+                                        class="chip-name"
+                                        on:click={() => pickModel(api.id, m)}
+                                        title="这类模型不能聊天，也不能生图"
+                                    >{m}</button>
+                                    <button
+                                        class="chip-mark"
+                                        on:click={() => toggleManualImage(api.id, m)}
+                                        title="名字没认出来但它其实是画图模型？点这里手动标记"
+                                    >标为画图</button>
+                                    <button class="chip-x" on:click={() => removeModel(api.id, m)} title="删掉这个模型">×</button>
+                                </span>
+                            {/each}
+                        </div>
+                    {/if}
+                    {#if api.models.length === 0}
+                        <div class="model-list"><span class="none">还没有模型</span></div>
+                    {/if}
                     <div class="model-add">
                         <input
                             value={newModelText[api.id] || ""}
-                            placeholder="输入模型名，例如 glm-5.3"
+                            placeholder="输入模型名，例如 glm-5.3 或 gpt-image-1"
                             on:input={(e) => (newModelText = { ...newModelText, [api.id]: e.currentTarget.value })}
                             on:keydown={(e) => { if (e.key === "Enter") { e.preventDefault(); addModel(api.id); } }}
                         />
@@ -411,9 +602,12 @@
                         </button>
                     </div>
                     <small>
-                        点模型名 = 立刻切到这个模型，顶栏会跟着变。× 删掉单个；
-                        「清除其他模型」会清掉没选中的，只留当前这个。
-                        灰底的名字看起来是画图/语音/嵌入模型，选了大概率报错。
+                        <b>勾选框 = 这个模型要不要出现在顶栏的切换列表里。</b>
+                        可以勾多个，勾几个顶栏就显示几个；没勾的名字会变淡。
+                        点模型名 = 立刻切到它（正在用的那个不能取消勾选）。
+                        × 删掉单个；「清除其他模型」只清没在用的。
+                        聊天模型和画图模型可以放在同一张卡里，它们共用地址和密钥。
+                        灰底的是嵌入/语音模型，聊不了天也画不了图。
                     </small>
                 </div>
 
@@ -719,6 +913,23 @@
         color: var(--b3-theme-on-surface);
         font-size: 11px;
     }
+    /* 模型分组小标题：聊天 / 画图 / 用不了 */
+    .group-label {
+        font-size: 10px;
+        color: var(--b3-theme-on-surface);
+        opacity: 0.75;
+        margin: 6px 0 3px;
+    }
+    .group-label em {
+        font-style: normal;
+        opacity: 0.8;
+    }
+    .group-label.image {
+        color: #b87413;
+    }
+    .group-label.dead {
+        opacity: 0.55;
+    }
     .clear-all {
         border: 1px solid var(--b3-border-color);
         background: none;
@@ -754,10 +965,73 @@
         border-color: var(--b3-theme-primary);
         background: var(--b3-theme-surface);
     }
+    /* 勾选框：决定这个模型会不会出现在顶栏的切换列表里 */
+    .chip-pick {
+        width: 13px;
+        height: 13px;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--b3-border-color);
+        background: var(--b3-theme-background);
+        border-radius: 3px;
+        font-size: 9px;
+        line-height: 1;
+        color: transparent;
+        cursor: pointer;
+        padding: 0;
+        font-family: inherit;
+    }
+    .chip-pick:hover {
+        border-color: var(--b3-theme-primary);
+    }
+    .chip-pick.on {
+        background: var(--b3-theme-primary);
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-on-primary);
+    }
+    /* 没勾选的模型名字淡一点，一眼看出"它不在顶栏里" */
+    .model-chip.unpicked .chip-name {
+        opacity: 0.55;
+    }
+
+    /* 手动标记按钮：小一号，放在模型名和 × 之间 */
+    .chip-mark {
+        border: none;
+        background: none;
+        color: var(--b3-theme-on-surface);
+        font-size: 9.5px;
+        cursor: pointer;
+        padding: 0 3px;
+        font-family: inherit;
+        opacity: 0.6;
+        white-space: nowrap;
+    }
+    .chip-mark:hover {
+        color: #b87413;
+        opacity: 1;
+    }
+    .model-chip.image .chip-mark {
+        opacity: 0.9;
+    }
+    /* 画图模型：橙色底，和聊天模型一眼分得开 */
+    .model-chip.image {
+        border-color: #d9a25c;
+        background: rgba(224, 139, 45, 0.12);
+    }
+    .model-chip.image.active {
+        border-color: #c8760a;
+        background: #c8760a;
+    }
+    .model-chip.image.active .chip-name {
+        color: #fff;
+    }
     /* 看起来不能聊天的名字给个灰底，点之前就能看出不对劲 */
     .model-chip.bad {
         border-style: dashed;
         background: var(--b3-theme-surface);
+        opacity: 0.72;
     }
     .chip-name {
         border: none;

@@ -19,6 +19,20 @@ export interface Settings {
     contextLimit: number;
     /** 一次生成里最多让模型调用几轮工具，防死循环 */
     maxToolRounds: number;
+    /**
+     * 上次选中的「能聊天」的模型。
+     *
+     * 顶栏切到画图模型时，activeApiId/model 指的是画图那套，
+     * 但「优化提示词」还得用会写字的模型，所以另外记一份。
+     * 格式是 "apiId::modelName"，空字符串表示还没有。
+     */
+    lastChatModel: string;
+    /** 生图的大小档位：1K / 2K / 4K */
+    imageSize: string;
+    /** 生图的比例，如 16:9 */
+    imageRatio: string;
+    /** 手动标成"这是画图模型"的模型名（正则认不出来时用它兜底） */
+    imageModels: string[];
 }
 
 /** 第一次装插件时的默认配置（和以前一样，指向本机中转站） */
@@ -48,6 +62,10 @@ export const DEFAULTS: Settings = {
     showReasoning: false,
     contextLimit: 200000,
     maxToolRounds: 8,
+    lastChatModel: "",
+    imageSize: "2K",
+    imageRatio: "16:9",
+    imageModels: [],
 };
 
 export const settings = writable<Settings>({ ...DEFAULTS });
@@ -86,6 +104,10 @@ export function initSettings(loaded: Partial<Settings> | null | undefined): Sett
     if (!pickActiveApi(merged.apis, merged.activeApiId)) {
         merged.activeApiId = merged.apis[0].id;
     }
+    // 老版本没有这个字段；手改配置也可能写进脏值
+    merged.imageModels = Array.isArray(merged.imageModels)
+        ? merged.imageModels.filter((m): m is string => typeof m === "string" && !!m.trim()).map((m) => m.trim())
+        : [];
     initialized = true;
     settings.set(merged);
     return merged;
@@ -108,6 +130,64 @@ export function snapshot(): Settings {
  */
 export function activeApi(s: Settings): ApiConfig {
     return pickActiveApi(s.apis, s.activeApiId) || createApi({ name: "未配置" }, "empty");
+}
+
+/** lastChatModel 的存储格式：apiId::模型名 */
+export function packModelRef(apiId: string, model: string): string {
+    const id = String(apiId || "").trim();
+    const m = String(model || "").trim();
+    if (!id || !m) return "";
+    return id + "::" + m;
+}
+
+/** 拆回 { apiId, model }；拆不出来返回 null */
+export function unpackModelRef(ref: string | undefined | null): { apiId: string; model: string } | null {
+    const s = String(ref || "");
+    const i = s.indexOf("::");
+    if (i <= 0) return null;
+    const apiId = s.slice(0, i);
+    const model = s.slice(i + 2);
+    if (!apiId || !model) return null;
+    return { apiId, model };
+}
+
+/**
+ * 该用哪套配置去「优化提示词」。
+ *
+ * 优先级：
+ *   1. 记住的上次聊天模型（还在这套 API 的清单里才算数）
+ *   2. 当前选中的模型本身就是聊天模型
+ *   3. 所有 API 里第一个能聊天的模型
+ *
+ * 都没有就返回 null —— 调用方要给主人一句「先去设置里加一个聊天模型」，
+ * 而不是拿画图模型去发一句必失败的请求。
+ */
+export function chatApiFor(
+    s: Settings,
+    isChat: (model: string) => boolean,
+    /** 手动标成画图的名字：这些即使名字不像画图，也不能当聊天模型用 */
+    manualImage: string[] = []
+): { api: ApiConfig; model: string } | null {
+    const usable = (m: string) => isChat(m) && !manualImage.includes(m);
+
+    const remembered = unpackModelRef(s.lastChatModel);
+    if (remembered) {
+        const api = s.apis.find((a) => a.id === remembered.apiId);
+        if (api && api.models.includes(remembered.model) && usable(remembered.model)) {
+            return { api, model: remembered.model };
+        }
+    }
+
+    const current = pickActiveApi(s.apis, s.activeApiId);
+    if (current && current.model && usable(current.model)) {
+        return { api: current, model: current.model };
+    }
+
+    for (const a of s.apis) {
+        const m = a.models.find((x) => usable(x));
+        if (m) return { api: a, model: m };
+    }
+    return null;
 }
 
 /** 扁平字段的改动（温度、思考档位这些） */

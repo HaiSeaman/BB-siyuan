@@ -1,9 +1,19 @@
 <script lang="ts">
     import { onMount, onDestroy, tick } from "svelte";
-    import { settings, updateSettings, updateSettingsWith, activeApi, initSettings, isInitialized, type Settings } from "../settings";
+    import {
+        settings,
+        updateSettings,
+        updateSettingsWith,
+        activeApi,
+        initSettings,
+        isInitialized,
+        packModelRef,
+        chatApiFor,
+        type Settings,
+    } from "../settings";
     import { endpointFor, headersFor, bodyFor, ProviderParser } from "../providers";
     import { supportsThinking, type ThinkingLevel } from "../thinking";
-    import { streamChat, channelInfo, fetchOnce } from "../net";
+    import { streamChat, channelInfo, fetchOnce, fetchBinary } from "../net";
     import { makeContext } from "../template";
     import { buildTurnPlan, type TurnPlan } from "../turnplan";
     import { estimateTokens, isTooLong, tooLongMessage } from "../tokens";
@@ -14,6 +24,41 @@
     import { makeSpawner } from "../mcp-spawn";
     import { runToolLoop } from "../tool-loop";
     import { friendlyError } from "../errors";
+    import { isChatModel, isChatModelOf, isImageModel, isImageModelOf, modelKindLabelOf, visibleModels } from "../apis";
+    import {
+        RATIOS,
+        SIZES,
+        planSize,
+        longEdgeOf,
+        computeSize,
+        imageEndpoint,
+        imageHeaders,
+        imageBody,
+        editParts,
+        buildMultipart,
+        parseImageResponse,
+        imageErrorOf,
+        checkReference,
+        imageFileName,
+        sizeSlug,
+        dataUrlToBytes,
+        type Ratio,
+        type SizeLevel,
+        type RefFile,
+        type ImageResult,
+    } from "../image";
+    import { saveImage, loadImageDataUrl, deleteImage, imagesFolderHint, openImagesFolder, mimeOfName, mimeOfPath, sniffImageMime } from "../image-store";
+    import { splitInlineImages, isHeavyInlineImage } from "../inline-image";
+    import {
+        OPTIMIZE_SYSTEM,
+        OPTIMIZE_MAX_TOKENS,
+        optimizeUserPrompt,
+        cleanOptimized,
+        looksEmpty,
+        optimizeHint,
+        optimizeFallbackHint,
+        optimizeErrorMessage,
+    } from "../optimize";
     import {
         normalizeSessions,
         upsertSession,
@@ -21,6 +66,7 @@
         sessionTitle,
         sameMessages,
         type Session,
+        type SessionImage,
     } from "../sessions";
     import SettingsPanel from "./Settings.svelte";
     import TemplateManager from "./TemplateManager.svelte";
@@ -34,11 +80,20 @@
     export let persistMcpServers: (list: McpServer[]) => void;
     export let initialSessions: Session[];
     export let persistSessions: (list: Session[]) => void;
+    /**
+     * 插件目录名。图片要靠它定位插件数据目录。
+     * 测试里不传也行，这时存图会报一句"插件名没传进来"。
+     */
+    export let pluginName: string = "";
 
     interface Turn {
         role: "user" | "assistant";
         content: string;
         reasoning: string;
+        /** 这条消息里的图片（生图模式才有）。只存路径，不存图片数据 */
+        images?: SessionImage[];
+        /** 我发消息时带的参考图文件名 */
+        refName?: string;
     }
 
     let cfg: Settings = initialSettings;
@@ -86,6 +141,41 @@
     /** 当前对话对应的会话 id；新建对话时换新的 */
     let currentSessionId = "";
 
+    // ---- 生图 / 对话 双模式 ----
+    /** 用户手动定的模式。null 表示"跟随当前模型自动判断" */
+    let modeOverride: "chat" | "image" | null = null;
+    /** 生图参数：直接存进设置，重开面板还在 */
+    $: imageSize = (cfg?.imageSize || "2K") as SizeLevel;
+    $: imageRatio = (cfg?.imageRatio || "16:9") as Ratio;
+
+    /** 换大小档位 */
+    function pickSize(s: SizeLevel) {
+        updateSettings({ imageSize: s }, (x) => persist(x));
+    }
+
+    /** 换比例 */
+    function pickRatio(r: Ratio) {
+        updateSettings({ imageRatio: r }, (x) => persist(x));
+    }
+
+    /** 比例菜单里那个小方框图标的宽高（只影响观感，14px 是基准） */
+    function ratioIcon(r: string): { w: number; h: number } {
+        const [a, b] = String(r).split(":").map(Number);
+        const box = 14;
+        if (!a || !b) return { w: box, h: box };
+        if (a >= b) return { w: box, h: Math.max(5, Math.round((box * b) / a)) };
+        return { h: box, w: Math.max(5, Math.round((box * a) / b)) };
+    }
+    /** 参考图（图生图用的那张本地图片） */
+    let refFile: RefFile | null = null;
+    let refError = "";
+    let fileInput: HTMLInputElement | null = null;
+    let refThumbs: Record<string, string> = {};
+    let optimizing = false;
+    let generating = false;
+    /** 正在等回复的那张图（占位用） */
+    let imgPickerMenus: "size" | "ratio" | null = null;
+
     onMount(() => {
         // 只在 store 还没被初始化过时才写入。
         // 面板会被反复挂载（切工作区、收起侧栏再打开），
@@ -101,11 +191,29 @@
         isMobile = typeof (window as any).require !== "function";
         rebuildMcp();
         void autoConnectMcp();
+        void hydrateImages();
+        // 上次没关掉面板就退出的旧数据：图混在正文里，挂载时也整理一遍，
+        // 整理完存一次，下次打开就不用再搬
+        void absorbAllInlineImages().then(() => saveCurrentSession());
     });
 
     // 面板被卸载时要把 MCP 子进程收掉，否则会一直挂着
     onDestroy(() => {
         if (mcp) void mcp.closeAll();
+        // 生图这一轮要掐掉
+        if (genAbort) {
+            try {
+                genAbort.abort();
+            } catch {}
+        }
+        // 聊天这一轮也要掐掉：不然面板已经销毁了，流还在跑，
+        // 每一小段都往已销毁的组件里写状态（白耗流量，控制台一堆错）
+        if (abortFn) {
+            try {
+                abortFn.abort();
+            } catch {}
+            abortFn = null;
+        }
     });
 
     function spawnProcess(cmd: string, args: string[], opts: any): any {
@@ -145,10 +253,16 @@
      * 只在有正文消息时存 —— 空对话存档只会让历史列表里堆垃圾。
      */
     function saveCurrentSession() {
-        const usable = messages.filter((m) => m.content.trim());
+        // 带图的消息即使没文字也要留着 —— 图片本身就是结果
+        const usable = messages.filter((m) => m.content.trim() || m.images?.length);
         if (!usable.length) return;
 
-        const snapshot = usable.map((m) => ({ role: m.role, content: m.content, reasoning: m.reasoning }));
+        const snapshot = usable.map((m) => {
+            const row: any = { role: m.role, content: m.content, reasoning: m.reasoning };
+            if (m.images?.length) row.images = m.images;
+            if (m.refName) row.refName = m.refName;
+            return row;
+        });
 
         const now = Date.now();
         const existing = sessions.find((s) => s.id === currentSessionId);
@@ -178,7 +292,13 @@
         const s = sessions.find((x) => x.id === id);
         if (!s) return;
         currentSessionId = s.id;
-        messages = s.messages.map((m) => ({ role: m.role, content: m.content, reasoning: m.reasoning }));
+        messages = s.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+            reasoning: m.reasoning,
+            images: m.images,
+            refName: m.refName,
+        }));
         drawer = null;
         statusText = "";
         activeTemplateId = null;
@@ -186,20 +306,61 @@
         openReasoning = -1;
         copiedIndex = -1;
         void scrollToEnd();
+        void hydrateImages();
+        // 老存档里的图是 base64 混在正文里的：打开时整理成卡片，顺手搬盘。
+        // 整理完必须再存一次，否则搬盘结果丢了，下次打开又要重搬一遍、
+        // 存档里也一直留着那段 base64。
+        void absorbAllInlineImages().then(() => saveCurrentSession());
     }
 
     function deleteSession(id: string) {
+        // 先把这个会话用到的图片文件删掉，否则磁盘上会攒一堆没主的图
+        const doomed = sessions.find((s) => s.id === id);
+        const paths = collectImagePaths(doomed ? [doomed] : []);
         sessions = removeSession(sessions, id);
         persistSessions(sessions);
         if (currentSessionId === id) {
             currentSessionId = "";
             messages = [];
         }
+        void removeImageFiles(paths);
+    }
+
+    /** 从若干会话里收集所有图片路径（用于删文件） */
+    function collectImagePaths(list: Session[]): string[] {
+        const out: string[] = [];
+        for (const s of list) {
+            for (const m of s.messages) {
+                for (const img of m.images || []) {
+                    if (img.path && !out.includes(img.path)) out.push(img.path);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 删掉一批图片文件。
+     *
+     * 不能因为某张删失败就中断：可能用户自己在资源管理器里删过了，
+     * 也可能某张是"只给了网址"没有本地文件的。逐张试，失败就跳过。
+     */
+    async function removeImageFiles(paths: string[]) {
+        if (!paths.length) return;
+        for (const p of paths) {
+            try {
+                await deleteImage(pluginName, p);
+            } catch {}
+        }
+        // 内存里缓存的缩略图也清掉，别留着占内存
+        const next = { ...refThumbs };
+        for (const p of paths) delete next[p];
+        refThumbs = next;
     }
 
     /** 一键清空所有历史对话（当前正在聊的内容也一起清，不然会马上又被存回来） */
     function clearAllSessions() {
-        if (streaming) {
+        if (streaming || generating) {
             statusText = "正在生成，先点「停止」再清空历史";
             return;
         }
@@ -208,7 +369,22 @@
             statusText = "还没有历史对话";
             return;
         }
-        if (!confirm(`清空全部 ${count} 个历史对话？删掉就找不回来了。`)) return;
+        // 连当前屏幕上这段对话的图也算进去：它马上也会被清掉
+        const inUse: Session = {
+            id: currentSessionId || "current",
+            title: "",
+            updatedAt: 0,
+            messages: messages.map((m) => ({
+                role: m.role,
+                content: m.content,
+                reasoning: m.reasoning,
+                images: m.images,
+                refName: m.refName,
+            })),
+        };
+        const paths = collectImagePaths([...sessions, inUse]);
+        const imgNote = paths.length ? `，同时删掉 ${paths.length} 张图片文件` : "";
+        if (!confirm(`清空全部 ${count} 个历史对话${imgNote}？删掉就找不回来了。`)) return;
 
         sessions = [];
         persistSessions(sessions);
@@ -216,7 +392,8 @@
         currentSessionId = "";
         messages = [];
         input = "";
-        statusText = `已清空 ${count} 个历史对话`;
+        void removeImageFiles(paths);
+        statusText = `已清空 ${count} 个历史对话${imgNote}`;
         setTimeout(() => {
             if (statusText.startsWith("已清空")) statusText = "";
         }, 3000);
@@ -242,6 +419,70 @@
     $: levelLabels = { off: "关", minimal: "最小", low: "低", medium: "中", high: "高", max: "最高" } as Record<string, string>;
     $: activeTemplate = activeTemplateId ? findTemplate(templates, activeTemplateId) : undefined;
 
+    // ---- 当前是什么模式 ----
+    /**
+     * 手动标成画图的名字（设置里那个名单）。
+     *
+     * 名字判断一定会漏（比如 gemini-3.1-flash-image 以前就漏了），
+     * 所以给主人留了一个"我告诉你这是画图模型"的开关。
+     */
+    $: manualImage = Array.isArray($settings?.imageModels) ? $settings.imageModels : [];
+
+    /**
+     * 当前模型是不是画图模型。
+     *
+     * 先看名字像不像（dall-e、gpt-image、*image*、flux、sd、imagen 这类），
+     * 再看主人有没有手动标过。
+     */
+    $: currentIsImage = isImageModelOf(api?.model || "", manualImage);
+    /** 最终生效的模式：手动定过就听手动的，否则跟着模型走 */
+    $: imageMode = modeOverride ? modeOverride === "image" : currentIsImage;
+    /** 生图模式下算好的最终尺寸（含"被官方尺寸表改过"的说明） */
+    $: sizePlan = planSize(imageSize, imageRatio, api?.model || "");
+    /** 生图/优化正在进行，界面上所有会打架的按钮都禁用 */
+    $: busyAny = streaming || generating || optimizing;
+
+    /**
+     * 切模式。
+     *
+     * 光改一个布尔值是不够的：模式最终由 currentIsImage 和 modeOverride 一起决定。
+     * 切到生图时要去找一个画图模型，切回对话时要去找一个聊天模型 ——
+     * 否则会出现"点在生图模式，但顶栏还是聊天模型"这种自相矛盾的界面。
+     */
+    function switchMode(target: "chat" | "image") {
+        if (busyAny) {
+            statusText = "正在生成，等这一轮结束再切模式";
+            return;
+        }
+        if (target === "image") {
+            const drawApi = findModelApi((m) => isImageModelOf(m, manualImage));
+            if (!drawApi) {
+                statusText = "还没有画图模型。去「⚙ 设置」里给某套 API 加一个，比如 gpt-image-1。";
+                return;
+            }
+            chooseModel(drawApi.apiId, drawApi.model);
+            modeOverride = "image";
+            statusText = "";
+            return;
+        }
+
+        // 切回对话：优先回到上次用的聊天模型
+        const back = chatApiFor($settings, isChatModel, manualImage);
+        if (back) chooseModel(back.api.id, back.model);
+        modeOverride = "chat";
+        statusText = "";
+    }
+
+    /** 在所有 API 的模型清单里找一个满足条件的模型 */
+    function findModelApi(match: (model: string) => boolean): { apiId: string; model: string } | null {
+        const list = $settings?.apis || [];
+        for (const a of list) {
+            const m = (a.models || []).find((x) => match(x));
+            if (m) return { apiId: a.id, model: m };
+        }
+        return null;
+    }
+
     /**
      * 切到某个 API 下的某个模型。
      *
@@ -249,22 +490,772 @@
      * 先用一次写入同时把 activeApiId 和那套 API 的 model 定下来，避免中间态。
      * 目标 API 不存在时什么都不做 —— 否则会把 activeApiId 写成一个悬空 id，
      * 之后整个面板都拿不到配置（顶栏会显示「未配置」）。
+     *
+     * 另外两件事一起做：
+     *   1. 切到聊天模型时记下 lastChatModel，「优化」按钮要用它
+     *   2. 切模型后把模式下调回"跟随模型"，不然手动切了模式再点模型会打架
      */
     function chooseModel(apiId: string, model: string) {
         modelPicker = false;
-        if (streaming) {
+        if (streaming || generating) {
             statusText = "正在生成，等这一轮结束再换模型";
             return;
         }
+        // 直接读 store 的名单，不经 $: 派生值：响应式语句的执行顺序不保证
+        const manual = Array.isArray($settings?.imageModels) ? $settings.imageModels : [];
+        const chatty = isChatModelOf(model, manual);
         // 和设置页走同一条保存路：直接在 store 里写盘会和它的延迟保存互相覆盖
         updateSettingsWith(
             (s) => {
                 if (!s.apis.some((a) => a.id === apiId)) return s;
                 const apis = s.apis.map((a) => (a.id === apiId ? { ...a, model } : a));
-                return { ...s, apis, activeApiId: apiId };
+                const next: any = { ...s, apis, activeApiId: apiId };
+                if (chatty) next.lastChatModel = packModelRef(apiId, model);
+                return next;
             },
             (s) => persist(s)
         );
+        modeOverride = null;
+    }
+
+    /** 点「图片」：打开自动保存图片的文件夹 */
+    async function openFolder() {
+        statusText = await openImagesFolder(pluginName);
+        setTimeout(() => {
+            if (/已打开|已在文件管理器|图片存在这里/.test(statusText)) statusText = "";
+        }, 6000);
+    }
+
+    // ---- 参考图 ----
+
+    /** 点「上传」：打开系统的选文件框 */
+    function pickReference() {
+        if (busyAny) {
+            statusText = "正在生成，等这一轮结束再传图";
+            return;
+        }
+        fileInput?.click();
+    }
+
+    /** 用户选好文件之后 */
+    async function onReferenceChosen(e: Event) {
+        const inputEl = e.currentTarget as HTMLInputElement;
+        const file = inputEl?.files?.[0];
+        // 选完清空 value：不然连着选同一个文件不会触发 change
+        if (inputEl) inputEl.value = "";
+        if (!file) return;
+
+        refError = "";
+        const bad = checkReference({ name: file.name, type: file.type, size: file.size });
+        if (bad) {
+            refError = bad;
+            statusText = bad;
+            return;
+        }
+
+        try {
+            const buf = new Uint8Array(await file.arrayBuffer());
+            const mime = file.type || mimeOfName(file.name);
+            refFile = { name: file.name, mime, data: buf };
+            statusText = `已选参考图「${file.name}」，会连同文字一起发出去`;
+        } catch (err: any) {
+            refFile = null;
+            statusText = "读取这张图失败：" + (err?.message || err);
+        }
+    }
+
+    function clearReference() {
+        refFile = null;
+        refError = "";
+        statusText = "";
+    }
+
+    // ---- 生图 ----
+
+    /** 生图请求正在跑时用它中止 */
+    let genAbort: AbortController | null = null;
+
+    /**
+     * 点「发送」（生图模式）。
+     *
+     * 一段话发出去，回来一张（或多张）图：
+     *   1. 先把占位消息插进对话区，让主人立刻看到"在做事"
+     *   2. 请求发出去（有参考图就是 /images/edits，没有就是 /images/generations）
+     *   3. 拿到的图片字节存进插件数据目录的 images/，对话里只记路径
+     *   4. 存不下来（比如路径不可写）也要显示出来，不能白花钱
+     */
+    async function generateImage(prompt: string) {
+        if (generating) return;
+        const text = String(prompt || "").trim();
+        if (!text) {
+            statusText = "先写点你想要画什么";
+            return;
+        }
+
+        const runApi = activeApi($settings);
+        if (!(runApi.baseURL || "").trim() || !(runApi.model || "").trim()) {
+            statusText = "先选一套 API 和模型（点顶栏那个模型名）";
+            return;
+        }
+        if (runApi.protocol !== "openai") {
+            statusText = "生图目前只支持 OpenAI 兼容接口。请把这套 API 的协议改成「OpenAI 兼容」。";
+            return;
+        }
+
+        const plan = planSize(imageSize, imageRatio, runApi.model);
+        const n = 1;
+        const runRef = refFile ? { ...refFile } : null;
+
+        // 先插消息：用户那句 + 空的回答占位
+        const userIndex = messages.length;
+        messages = [
+            ...messages,
+            {
+                role: "user",
+                content: text,
+                reasoning: "",
+                refName: runRef?.name,
+            },
+            { role: "assistant", content: "", reasoning: "" },
+        ];
+        input = "";
+        refFile = null;
+        generating = true;
+        genAbort = new AbortController();
+        // 记住这一轮的 controller：用户点停止后，晚到的结果不能再往界面里写
+        const myAbort = genAbort;
+        const answerIndex = userIndex + 1;
+
+        /** 这一轮是不是已经被用户停掉了 */
+        const isStopped = () => myAbort.signal.aborted;
+
+        try {
+            statusText = runRef
+                ? `正在按参考图生成图片（${plan.label}）…`
+                : `正在生成图片（${plan.label}）…`;
+            if (plan.adjusted) statusText += " " + plan.note;
+
+            const result = await requestImages(runApi, text, plan.api, n, runRef, myAbort.signal);
+            // 用户已经点了停止：结果直接丢掉，别把"停止前的半张图"塞进对话。
+            // 占位的那条 assistant 也要删掉 —— 否则界面上留一个空气泡，
+            // 而存档又会把它过滤掉，两边不一致。
+            if (isStopped()) {
+                const ph = messages[answerIndex];
+                if (ph && !ph.images?.length && !ph.content.trim()) {
+                    messages = messages.slice(0, answerIndex);
+                    messages = messages;
+                }
+                return;
+            }
+            if (!result.dataUrls.length && !result.urls.length) {
+                throw new Error(imageErrorOf(null));
+            }
+
+            // 存盘。存不下来也要显示 —— 至少能让主人手动保存
+            const saved: SessionImage[] = [];
+            let saveFail = "";
+            // 每条消息里图片的编号从 1 开始；一张一回出多张时，
+            // 存盘失败的那张要按"本次第几张"记，才不会和前面的串号
+            let idx = 0;
+            for (const dataUrl of result.dataUrls) {
+                idx++;
+                const decoded = dataUrlToBytes(dataUrl);
+                if (!decoded) continue;
+                // 以真实字节为准：中转站常把 JPEG 塞在写着 png 的 data URL 里，
+                // 照 data URL 起名会让文件"名不副实"，之后显示会被 WebView 拒绝
+                const realMime = sniffImageMime(decoded.bytes, decoded.mime);
+                let relPath = "";
+                try {
+                    const name = imageFileName(new Date(), plan.api, idx, realMime);
+                    const s = await saveImage(pluginName, name, decoded.bytes, realMime);
+                    relPath = s.path;
+                } catch (err: any) {
+                    saveFail = String(err?.message || err);
+                }
+                // 存盘成功就走文件；失败就挂在图片自己身上（只在内存里，不进存档）
+                saved.push({
+                    path: relPath,
+                    size: plan.label,
+                    prompt: result.revisedPrompt || text,
+                    url: "",
+                    mem: relPath ? "" : dataUrl,
+                });
+            }
+            // 有的中转站只给网址：这些没法存盘，先记下网址
+            let urlIdx = 0;
+            for (const u of result.urls) {
+                urlIdx++;
+                saved.push({ path: "", url: u, size: plan.label, prompt: result.revisedPrompt || text });
+            }
+
+            const target = messages[answerIndex];
+            if (target) {
+                target.images = saved;
+                target.content = ""; // 图片消息不需要文字，界面按 images 渲染
+                messages = messages;
+            }
+
+            if (saveFail) {
+                statusText =
+                    "图片已生成，但存文件失败：" + saveFail + "。可以用图片下面的「保存到电脑」自己存一份。";
+            } else if (saved.some((x) => x.url)) {
+                statusText = "图片已生成（服务商直接给了网址，这张没存进本地 images 文件夹）";
+            } else {
+                statusText = `已生成 ${saved.length} 张，自动存到：${imagesFolderHint(pluginName)}`;
+            }
+            void hydrateImages();
+        } catch (e: any) {
+            const msg = String(e?.message || e);
+            if (isStopped() || /已停止|aborted/i.test(msg)) {
+                statusText = "已停止";
+            } else {
+                statusText = explainImageError(msg);
+            }
+            // 失败就把占位删掉，别留一条空白回答
+            const target = messages[answerIndex];
+            if (target && !target.images?.length && !target.content.trim()) {
+                messages = messages.slice(0, answerIndex);
+                messages = messages;
+            }
+        } finally {
+            // 只有这一轮还是"当前这轮"时才清状态。
+            // 用户停止后马上又点了一次生成时，旧一轮的 finally 会晚到，
+            // 那时无条件清 generating 会把新一轮的按钮/输入框提前解锁，
+            // 表现成"能重复发送"、"停止按钮闪一下就没了"。
+            if (genAbort === myAbort) {
+                generating = false;
+                genAbort = null;
+            }
+            void scrollToEnd();
+            saveCurrentSession();
+        }
+    }
+
+    /**
+     * 真正发请求。
+     *
+     * 图生图必须用 multipart，两种通道都得照顾到：
+     * 电脑端把原始字节目传给主进程，手机端由内核按 base64 解码后原样发出。
+     */
+    async function requestImages(
+        runApi: { baseURL: string; apiKey: string; model: string },
+        prompt: string,
+        size: string,
+        n: number,
+        ref: RefFile | null,
+        signal: AbortSignal | undefined
+    ): Promise<ImageResult> {
+        const opts = {
+            protocol: "openai" as const,
+            baseURL: runApi.baseURL,
+            apiKey: runApi.apiKey,
+            model: runApi.model,
+            prompt,
+            size,
+            n,
+            reference: ref || undefined,
+        };
+
+        const mode = ref ? "edits" : "generations";
+        const url = imageEndpoint(runApi.baseURL, mode);
+
+        let headers: Record<string, string>;
+        let body: string | undefined;
+        let rawBody: Uint8Array | undefined;
+
+        if (ref) {
+            // 图生图：multipart
+            const built = buildMultipart(editParts(opts));
+            rawBody = built.body;
+            headers = { ...imageHeaders(runApi.apiKey) };
+            headers["Content-Type"] = built.contentType;
+            delete headers.Accept;
+        } else {
+            headers = imageHeaders(runApi.apiKey);
+            body = JSON.stringify(imageBody(opts));
+        }
+
+        // 真中止：signal 一路传到三条通道，点「停止」会掐断底层请求，
+        // 而不是像以前那样只是让上层不等了（后台还在跑满 5 分钟）。
+        const result = await fetchBinary(url, {
+            method: "POST",
+            headers,
+            body,
+            rawBody,
+            // 生图慢，给足时间；4K 有时要两三分钟
+            timeoutMs: 300000,
+            signal,
+        });
+
+        const text = await result.text();
+        if (!result.ok) {
+            // 服务商的报错就在响应体里，尽量原样带出来
+            let detail = text;
+            try {
+                const j = JSON.parse(text);
+                detail = imageErrorOf(j);
+            } catch {}
+            throw new Error(`接口返回 ${result.status}${detail ? "：" + detail.slice(0, 300) : ""}`);
+        }
+
+        let json: any = null;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            throw new Error("接口返回的不是 JSON，可能这个地址不是生图接口");
+        }
+        if (json?.error) throw new Error(imageErrorOf(json));
+        return parseImageResponse(json);
+    }
+
+    /** 生图报错的人话翻译。生图这行的坑和聊天完全不一样 */
+    function explainImageError(raw: string): string {
+        const m = String(raw || "");
+        if (/401|403/.test(m)) return "生图失败：密钥不对或没权限。去设置里检查这套 API 的 Key。";
+        if (/Invalid URL|404/i.test(m)) {
+            // 最常见：地址填了裸域名（少了 /v1），中转站只会回 404 Invalid URL
+            const base = String(activeApi($settings)?.baseURL || "").trim();
+            if (base && !/\/v\d+[a-z]*$/i.test(base) && !/\/chat\/completions$/i.test(base)) {
+                return `生图失败：地址少了 /v1。现在填的是「${base}」，改成「${base}/v1」再试。`;
+            }
+            return "生图失败：接口地址找不到。确认地址末尾是 /v1（插件会自动接 /images/generations）。";
+        }
+        if (/429/.test(m)) return "生图失败：请求太频繁或额度用完了，等一会儿再试。";
+        if (/size|尺寸|dimension/i.test(m)) {
+            return "生图失败：这个模型不接受这个尺寸。把「大小」调小一点，或者换成 1:1 试试。";
+        }
+        if (/multipart|form-data|boundary/i.test(m)) {
+            return "生图失败：这个服务商不支持图生图（传参考图）。把参考图去掉，只用文字生成。";
+        }
+        if (/image/i.test(m) && /(invalid|unsupported|not\s*support)/i.test(m)) {
+            return "生图失败：这个模型不支持传参考图。去掉参考图再试。";
+        }
+        if (/model.*not.*found|模型不存在|invalid\s*model/i.test(m)) {
+            return "生图失败：这个模型名不对。去设置里重新选一个画图模型。";
+        }
+        if (/content|safety|违规|拦截/i.test(m)) {
+            return "生图失败：内容被服务商的安全策略拦下了。换个说法再试。";
+        }
+        return "生图失败：" + (m || "原因不明");
+    }
+
+    /** 中止生图 */
+    function stopGenerate() {
+        genAbort?.abort();
+        generating = false;
+        statusText = "已停止";
+    }
+
+    // ---- 优化提示词 ----
+
+    /**
+     * 点「优化」：用聊天模型把输入框里的话改写成中文提示词。
+     *
+     * 必须用聊天模型 —— 画图模型不会写字。
+     * 所以这里不看顶栏当前是什么模型，而是走 chatApiFor：
+     * 找到上次用的聊天模型 / 第一个能聊天的模型。
+     */
+    async function optimizePrompt() {
+        if (optimizing) return;
+        const text = (input || "").trim();
+        if (!text) {
+            statusText = "先写点你想要画什么，再点优化";
+            return;
+        }
+
+        // 必须把手动标记的名单一起传进去，否则手动标成画图模型的
+        // 会被当成聊天模型选去优化，必然报错
+        const manual = Array.isArray($settings?.imageModels) ? $settings.imageModels : [];
+        const target = chatApiFor($settings, isChatModel, manual);
+        if (!target) {
+            statusText = "优化要用聊天模型，但现在一套都没有。去设置里加一个，比如 glm-5.3。";
+            return;
+        }
+
+        optimizing = true;
+        statusText = `正在用 ${target.api.name || "未命名"} · ${target.model} 优化提示词…`;
+
+        try {
+            const out = await runOptimize(target.api, target.model, text);
+            const clean = cleanOptimized(out);
+            if (looksEmpty(clean)) {
+                statusText = optimizeFallbackHint();
+                return;
+            }
+            input = clean;
+            statusText = optimizeHint(target.api.name, target.model);
+        } catch (e: any) {
+            statusText = optimizeErrorMessage(String(e?.message || e));
+        } finally {
+            optimizing = false;
+            void tick().then(() => {
+                // 优化完把光标放回输入框末尾，方便接着改
+                const ta = document.querySelector("#compose-input") as HTMLTextAreaElement | null;
+                ta?.focus();
+            });
+        }
+    }
+
+    /**
+     * 发一次不计入对话的"旁路"请求，只为拿回一段文字。
+     *
+     * 不写进 messages、不调工具、不存历史：
+     * 优化只是改一句话，不该在聊天记录里留下痕迹。
+     */
+    function runOptimize(apiCfg: any, model: string, text: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const runCfg = {
+                ...$settings,
+                ...apiCfg,
+                model,
+                temperature: 0.7,
+                maxTokens: OPTIMIZE_MAX_TOKENS,
+                // 优化是短任务，思考档位调低一点更快，也不容易把思考内容混进结果
+                thinking: "low" as ThinkingLevel,
+            };
+
+            let out = "";
+            let settled = false;
+            const done = (err?: string) => {
+                if (settled) return;
+                settled = true;
+                if (err) reject(new Error(err));
+                else resolve(out);
+            };
+
+            const parser = new ProviderParser(
+                apiCfg.protocol,
+                (t) => {
+                    out += t;
+                },
+                () => {}
+            );
+
+            let raw = "";
+            try {
+                raw = JSON.stringify(
+                    bodyFor(
+                        apiCfg.protocol,
+                        runCfg,
+                        [{ role: "user", content: optimizeUserPrompt(text) }],
+                        OPTIMIZE_SYSTEM
+                    )
+                );
+            } catch (e: any) {
+                reject(new Error("拼请求出错：" + (e?.message || e)));
+                return;
+            }
+
+            const handle = streamChat(
+                {
+                    url: endpointFor(apiCfg.protocol, apiCfg.baseURL, model),
+                    headers: headersFor(apiCfg.protocol, apiCfg),
+                    body: raw,
+                },
+                {
+                    onDelta: (chunk) => {
+                        if (settled) return;
+                        try {
+                            parser.push(chunk);
+                        } catch (e: any) {
+                            done(String(e?.message || e));
+                        }
+                    },
+                    onEnd: (err) => {
+                        if (settled) return;
+                        try {
+                            parser.end();
+                        } catch (e: any) {
+                            done(String(e?.message || e));
+                            return;
+                        }
+                        done(err);
+                    },
+                }
+            );
+
+            // 兜底：90 秒还没结果就放弃，避免按钮一直转
+            setTimeout(() => {
+                if (settled) return;
+                try {
+                    handle.abort();
+                } catch {}
+                done("优化超时（90 秒没有回应）");
+            }, 90000);
+        });
+    }
+
+    // ---- 图片的显示 / 复制 / 保存 ----
+
+    /** 每张图读取失败的原因，界面上能说清楚到底哪一步断了 */
+    let imgErrors: Record<string, string> = {};
+
+    /**
+     * 把会话里所有"只有路径"的图片读成能显示的数据。
+     *
+     * 读不到时把原因记下来，不再静默失败 —— 否则界面上只有一句
+     * "这张图找不到了"，主人根本分不清是文件删了还是接口出错。
+     */
+    /**
+     * 读图失败时，如果发现"文件名说 png、实际是 jpeg"，换正确的后缀再读一次。
+     *
+     * 老版本是按 data URL 里的 mime 起名的，中转站把 JPEG 塞在 png 里，
+     * 于是磁盘上全是 .png 装着 JPEG。这类文件在部分 WebView 里渲染不出来，
+     * 但复制/保存走字节直通所以是好的 —— 表现就是"看不见但能存"。
+     */
+    async function retryWithRealExt(path: string): Promise<{ path: string; dataUrl: string } | null> {
+        const base = path.replace(/\.[^.]+$/, "");
+        const cur = (path.split(".").pop() || "").toLowerCase();
+        // 只试和当前不同的后缀，顺序按"最可能是 JPEG"排（中转站最常给 jpeg）
+        for (const ext of ["jpg", "jpeg", "png", "webp"]) {
+            if (ext === cur) continue;
+            const tryPath = base + "." + ext;
+            try {
+                const d = await loadImageDataUrl(pluginName, tryPath);
+                if (d) return { path: tryPath, dataUrl: d };
+            } catch {}
+        }
+        return null;
+    }
+
+    async function hydrateImages() {
+        const need: string[] = [];
+        for (const m of messages) {
+            for (const img of m.images || []) {
+                if (img.path && !refThumbs[img.path] && !imgErrors[img.path]) need.push(img.path);
+            }
+        }
+        if (!need.length) return;
+
+        const updates: Record<string, string> = {};
+        const errs: Record<string, string> = {};
+        for (const p of need) {
+            try {
+                const d = await loadImageDataUrl(pluginName, p);
+                if (d) {
+                    updates[p] = d;
+                    continue;
+                }
+                // 读不到时试着换后缀读：历史数据里常见"png 装着 jpeg"
+                const alt = await retryWithRealExt(p);
+                if (alt) {
+                    updates[alt.path] = alt.dataUrl;
+                    // 把会话里的路径也改过去，下次打开就直接能读
+                    for (const m of messages) {
+                        for (const img of m.images || []) {
+                            if (img.path === p) img.path = alt.path;
+                        }
+                    }
+                    messages = messages;
+                } else {
+                    errs[p] = "读不到这个文件（也试过换后缀）";
+                }
+            } catch (e: any) {
+                errs[p] = String(e?.message || e);
+            }
+        }
+        if (Object.keys(updates).length) refThumbs = { ...refThumbs, ...updates };
+        if (Object.keys(errs).length) imgErrors = { ...imgErrors, ...errs };
+    }
+
+    /** 手动重试一次：清掉失败记录再读 */
+    async function retryImage(path: string) {
+        if (!path) return;
+        const next = { ...imgErrors };
+        delete next[path];
+        imgErrors = next;
+        await hydrateImages();
+        if (!refThumbs[path]) statusText = "还是读不出来：" + (imgErrors[path] || "未知原因");
+    }
+
+    /**
+     * 每张"图片数据"当前该用什么地址显示，键是 path / url / mem 标识。
+     *
+     * 为什么要有这张表：模板里如果直接调 imageSrc(img, gi)，
+     * Svelte 看不到函数内部读了 refThumbs，refThumbs 更新后模板不会重算，
+     * 图就永远停在最初那个（读不到的）地址上 —— 表现正是"看不见但能存"。
+     */
+    $: imgSrcMap = (() => {
+        const map: Record<string, string> = {};
+        for (const m of messages) {
+            for (const img of m.images || []) {
+                const key = img.path || img.url || img.mem || "";
+                if (!key) continue;
+                const src = imageSourceOf(img, refThumbs, imgErrors);
+                if (src.kind === "data" || src.kind === "url") map[key] = src.value;
+                else if (src.kind === "file" && pluginName) map[key] = storageUrl(pluginName, src.value);
+                else map[key] = "";
+            }
+        }
+        return map;
+    })();
+
+    /**
+     * 一张图该从哪儿取。
+     *
+     * 显示和"复制/保存"必须用同一套优先级，否则会出现
+     * "界面看得到、保存说找不到"这种自相矛盾。
+     */
+    function imageSourceOf(
+        img: SessionImage,
+        thumbs: Record<string, string>,
+        errors: Record<string, string>
+    ): { kind: "data" | "url" | "file" | "none"; value: string } {
+        // 已经读成 data URL 的最可靠
+        if (img.path && thumbs[img.path]) return { kind: "data", value: thumbs[img.path] };
+        // 服务商给的网址
+        if (img.url) return { kind: "url", value: img.url };
+        // 存盘失败时留在内存里的副本
+        if (img.mem) return { kind: "data", value: img.mem };
+        // 明确读失败了：别再拿静态地址硬顶，让界面显示原因
+        if (img.path && errors[img.path]) return { kind: "none", value: "" };
+        // 还没读完：先用静态地址占位
+        if (img.path) return { kind: "file", value: img.path };
+        return { kind: "none", value: "" };
+    }
+
+    /**
+     * 思源对插件数据目录的静态访问地址。
+     * 形如 /storage/petal/<插件名>/images/xxx.png，由内核直接当文件发。
+     */
+    function storageUrl(plugin: string, rel: string): string {
+        const clean = String(rel || "")
+            .split("/")
+            .filter(Boolean)
+            .map((seg) => encodeURIComponent(seg))
+            .join("/");
+        return "/storage/petal/" + encodeURIComponent(plugin) + "/" + clean;
+    }
+
+    /** 把一张图拿到手（用于复制/保存），拿不到返回 null */
+    async function fetchImageBlob(img: SessionImage): Promise<{ bytes: Uint8Array; mime: string } | null> {
+        if (img.path) {
+            const du = await loadImageDataUrl(pluginName, img.path);
+            const dec = du ? dataUrlToBytes(du) : null;
+            if (dec) return dec;
+        }
+        if (img.url) {
+            try {
+                const r = await fetchBinary(img.url, { method: "GET", headers: {} });
+                if (r.ok) {
+                    const bytes = await r.bytes();
+                    // 以字节为准：服务商"图片网址"有时返回的是 JSON 错误体，
+                    // 直接当图片存下去会得到一个打不开的文件
+                    const sniffed = sniffImageMime(bytes, "");
+                    if (!sniffed) return null;
+                    return { bytes, mime: sniffed };
+                }
+            } catch {}
+        }
+        // 存盘失败的那张：用它自己携带的内存副本
+        if (img.mem) {
+            const dec = dataUrlToBytes(img.mem);
+            if (dec) return dec;
+        }
+        return null;
+    }
+
+    /**
+     * 复制图片本身到剪贴板。
+     *
+     * 走 navigator.clipboard.write（要 ClipboardItem + Blob），
+     * 电脑上的 Electron 支持；手机上多半不行，那就退回"复制图片地址/提示手动保存"。
+     */
+    async function copyImage(img: SessionImage) {
+        const got = await fetchImageBlob(img);
+        if (!got) {
+            statusText = "这张图找不到了（可能被手动删掉了）";
+            return;
+        }
+        try {
+            const nav: any = navigator;
+            if (nav.clipboard?.write && typeof (window as any).ClipboardItem === "function") {
+                const blob = new Blob([got.bytes as any], { type: got.mime });
+                // 有的环境只认 png，两种都试一遍
+                const items: any[] = [new (window as any).ClipboardItem({ [got.mime]: blob })];
+                try {
+                    await nav.clipboard.write(items);
+                    statusText = "图片已复制，去笔记里粘贴";
+                    return;
+                } catch {
+                    const pngBlob = new Blob([got.bytes as any], { type: "image/png" });
+                    await nav.clipboard.write([new (window as any).ClipboardItem({ "image/png": pngBlob })]);
+                    statusText = "图片已复制，去笔记里粘贴";
+                    return;
+                }
+            }
+        } catch {}
+        statusText = "这个环境不能把图片放进剪贴板。请点「保存到电脑」，再把文件拖进笔记。";
+    }
+
+    /**
+     * 保存到电脑：弹系统的「另存为」。
+     *
+     * 浏览器/手机没有真正的"选文件夹"能力，就用 <a download> —— 系统会自己
+     * 弹下载框让主人选位置。桌面端思源里也一样能弹出保存对话框。
+     */
+    async function saveImageToDisk(img: SessionImage) {
+        const got = await fetchImageBlob(img);
+        if (!got) {
+            statusText = "这张图找不到了。可能被手动删掉了，也可能是服务商给的网址过期了。";
+            return;
+        }
+        const mime = got.mime || "image/png";
+        const name = imageFileName(new Date(), sizeSlug(img.size || ""), 1, mime);
+
+        // 1) 桌面版：走 Electron 原生「另存为」，主人能自己选文件夹。
+        //    思源桌面里 <a download> 经常静默失败（不弹窗、也不落盘），必须走这条。
+        const req = (window as any).require;
+        if (typeof req === "function") {
+            try {
+                const remote = req("@electron/remote");
+                const dialog = remote?.dialog;
+                const fs = req("fs");
+                if (dialog?.showSaveDialog && fs) {
+                    const picked = await dialog.showSaveDialog({
+                        title: "保存图片",
+                        defaultPath: name,
+                        filters: [
+                            {
+                                name: "图片",
+                                extensions: [mime === "image/jpeg" ? "jpg" : mime === "image/webp" ? "webp" : "png"],
+                            },
+                        ],
+                    });
+                    if (picked?.canceled || !picked?.filePath) {
+                        statusText = "已取消保存";
+                        return;
+                    }
+                    // 不写 Buffer：渲染进程里没有这个全局，fs 直接接受 Uint8Array
+                    fs.writeFileSync(picked.filePath, got.bytes);
+                    statusText = "已保存到 " + picked.filePath;
+                    return;
+                }
+            } catch (e: any) {
+                // 拿不到原生对话框就往下走下载兜底，原因留在状态栏
+                statusText = "原生保存不可用，改用下载：" + (e?.message || e);
+            }
+        }
+
+        // 2) 兜底：浏览器下载（手机、或 remote 不可用）
+        try {
+            const blob = new Blob([got.bytes as any], { type: mime });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => {
+                try {
+                    URL.revokeObjectURL(url);
+                } catch {}
+            }, 10000);
+            statusText = "已保存「" + name + "」。图片同时也留在 " + imagesFolderHint(pluginName);
+        } catch (e: any) {
+            statusText = "保存失败：" + (e?.message || e);
+        }
     }
 
     /** 打开抽屉时顺手把模型切换器收掉，避免两层叠在一起 */
@@ -349,6 +1340,15 @@
         abortFn = null;
         streaming = false;
         statusText = "已停止";
+    }
+
+    /** 点「停止」时一次收掉两条路：聊天和生图 */
+    function stopAll() {
+        if (generating) {
+            stopGenerate();
+            return;
+        }
+        stop();
     }
 
     /**
@@ -498,8 +1498,8 @@
                 // 否则会把用户紧接着发起的新一轮的 abortFn 给清掉，导致停不下来
                 if (abortFn === myHandle) abortFn = null;
                 scrollToEnd();
-                // 生成结束（无论成败）都存一次，断线也能留下已有内容
-                saveCurrentSession();
+                // 有的服务商把图混在文字里返回：整理成图片卡片再存盘
+                void absorbAllInlineImages().then(() => saveCurrentSession());
             });
     }
 
@@ -589,15 +1589,26 @@
         };
     }
 
-    /** 点「发送」：带上当前绑定的模板 */
+    /** 点「发送」：按当前模式分流 */
     function send() {
-        if (streaming) return;
+        if (busyAny) return;
         // 输入框里的软键盘还开着时点发送，先把选择器收掉，别挡着结果
         modelPicker = false;
+        imgPickerMenus = null;
         const text = input.trim();
 
         if (!text) {
-            statusText = activeTemplateId ? "写点什么再发（按 Ctrl+Enter）" : "先写点要求再发";
+            statusText = imageMode
+                ? "写点你想要画什么"
+                : activeTemplateId
+                ? "写点什么再发（按 Ctrl+Enter）"
+                : "先写点要求再发";
+            return;
+        }
+
+        // 生图模式：走生图接口，不碰聊天那条路
+        if (imageMode) {
+            void generateImage(text);
             return;
         }
 
@@ -690,9 +1701,11 @@
      * 不新增消息 —— 用户要的是「同一条消息换个答案」，
      * 点完聊天记录里还是一组「原话 + 回答」，不会变成两组。
      * 发给模型的历史只截到这条之前，否则等于让它看着自己的旧答案再答一遍。
+     *
+     * 生图模式下的重发：原话就是提示词，重新画一张替换旧图。
      */
     function resend(i: number) {
-        if (streaming) {
+        if (busyAny) {
             statusText = "正在生成，等这一轮结束再重发";
             return;
         }
@@ -704,6 +1717,24 @@
         // 只有我自己发的消息才配重发；回答那条没有原话可重问，别乱改记录
         if (messages[i]?.role !== "user") {
             statusText = "只能重发自己发的消息";
+            return;
+        }
+
+        // 生图：重画一张，把原来那张图替换掉
+        if (imageMode) {
+            if (messages[i + 1]?.role === "assistant") {
+                messages[i + 1].content = "";
+                messages[i + 1].images = [];
+                messages[i + 1].reasoning = "";
+                messages = messages;
+            } else {
+                messages = [
+                    ...messages.slice(0, i + 1),
+                    { role: "assistant", content: "", reasoning: "" },
+                    ...messages.slice(i + 1),
+                ];
+            }
+            void generateImage(text);
             return;
         }
 
@@ -734,7 +1765,7 @@
 
     function newChat() {
         // 生成中清空会让正在跑的循环读写已不存在的消息，直接崩。先停。
-        if (streaming) {
+        if (busyAny) {
             statusText = "正在生成，先点「停止」再开新对话";
             return;
         }
@@ -747,6 +1778,8 @@
         currentSessionId = "";
         openReasoning = -1;
         copiedIndex = -1;
+        refFile = null;
+        refError = "";
     }
 
     /** 取消当前绑定的模板，回到没规则的自由对话 */
@@ -779,8 +1812,13 @@
     }
 
     function onKeydown(e: KeyboardEvent) {
-        // Esc 收掉模型切换器：万一遮罩出了什么意外，这是不依赖鼠标的退路
+        // Esc：先收掉生图的两个下拉，再收掉模型切换器
         if (e.key === "Escape") {
+            if (imgPickerMenus) {
+                imgPickerMenus = null;
+                e.preventDefault();
+                return;
+            }
             if (modelPicker) {
                 modelPicker = false;
                 e.preventDefault();
@@ -799,9 +1837,84 @@
         e.preventDefault();
         send();
     }
+
+    /** 点面板空白处把生图的下拉收掉（和模型切换器的行为保持一致） */
+    function closeImgMenus(e: MouseEvent) {
+        if (!imgPickerMenus) return;
+        const t = e.target as HTMLElement | null;
+        if (t?.closest?.(".menu-anchor")) return;
+        imgPickerMenus = null;
+    }
+
+    /**
+     * 把正文里的图片抽出来（服务商把图混在文字里返回的那种）。
+     *
+     * 真实场景：gemini-3.1-flash-image 返回的是
+     *   ![image](data:image/jpeg;base64,...)   整条消息 964KB
+     * 以前它只会当文字渲染，底下一个「复制」，既没法保存，base64 还把存档撑爆。
+     * 现在抽成标准图片，走统一卡片（复制 + 保存），大图同时搬进 images/。
+     */
+    async function absorbInlineImages(index: number) {
+        const m = messages[index];
+        if (!m || m.role !== "assistant") return;
+        if (m.images?.length) return;
+        const { images, rest } = splitInlineImages(m.content || "");
+        if (!images.length) return;
+
+        const saved: SessionImage[] = [];
+        // 图都有了去处（磁盘或内存）之后，正文才敢把 base64 扔掉，否则图就没了
+        let imgIdx = 0;
+        for (const img of images) {
+            imgIdx++;
+            let path = "";
+            let mem = "";
+            if (isHeavyInlineImage(img.src)) {
+                try {
+                    const decoded = dataUrlToBytes(img.src);
+                    if (decoded) {
+                        const realMime = sniffImageMime(decoded.bytes, decoded.mime);
+                        // 必须带下标：同一条消息里常有多张图，
+                        // 全传 1 会让它们在同一秒内撞名，后一张覆盖前一张（丢图）。
+                        // 尺寸位传 "msg" 是为了让搬盘来的图与生图目录里的图一眼分得开。
+                        const name = imageFileName(new Date(), "msg", imgIdx, realMime);
+                        const s = await saveImage(pluginName, name, decoded.bytes, realMime);
+                        path = s.path;
+                    }
+                } catch {
+                    mem = img.src;
+                }
+            }
+            saved.push({
+                path,
+                size: "",
+                prompt: rest.slice(0, 80),
+                url: path || mem ? "" : img.src,
+                mem,
+            });
+        }
+
+        // 每张图都必须有去处，才能把正文里的 base64 摘掉
+        const allSafe = saved.every((x) => x.path || x.mem || x.url);
+        if (!allSafe) return;
+
+        const target = messages[index];
+        if (!target) return;
+        target.images = saved;
+        target.content = rest;
+        messages = messages;
+        if (saved.some((x) => x.path)) void hydrateImages();
+    }
+
+    /** 把当前对话里所有"图混在正文里"的消息整理一遍 */
+    async function absorbAllInlineImages() {
+        for (let i = 0; i < messages.length; i++) {
+            await absorbInlineImages(i);
+        }
+    }
+
 </script>
 
-<svelte:window on:keydown={onKeydown} />
+<svelte:window on:keydown={onKeydown} on:click={closeImgMenus} />
 
 <div class="panel">
     <!-- 顶栏：品牌 / 模型 / 历史 / 管理 / 设置 -->
@@ -810,10 +1923,11 @@
         <button
             class="model-btn"
             class:open={modelPicker}
+            class:img={imageMode}
             on:click|stopPropagation={() => (modelPicker = !modelPicker)}
             title="切换 API 和模型"
         >
-            <span class="dot-api"></span>
+            <span class="dot-api" class:draw={imageMode}></span>
             <span class="mb-text">{api.name || "未命名"} · {api.model || "未选模型"}</span>
             <span class="caret">▾</span>
         </button>
@@ -847,18 +1961,24 @@
                     <div class="api-name">
                         <span class="dot" class:ok={a.id === cfg.activeApiId}></span>
                         {a.name || "未命名"}
-                        <em>{a.models.length} 个模型</em>
+                        <em>{visibleModels(a).length} / {a.models.length} 个已勾选</em>
                     </div>
                     {#if a.models.length === 0}
                         <div class="api-empty">还没填模型（去设置里加）</div>
+                    {:else if visibleModels(a).length === 0}
+                        <div class="api-empty">还没勾选模型（去设置里勾一下）</div>
                     {/if}
-                    {#each a.models as m}
+                    {#each visibleModels(a) as m}
+                        {@const kind = modelKindLabelOf(m, manualImage)}
                         <button
                             class="model-row"
                             class:active={a.id === cfg.activeApiId && a.model === m}
+                            class:img={kind === "画图"}
+                            class:bad={kind === "不能聊天"}
                             on:click={() => chooseModel(a.id, m)}
                         >
                             <span class="m-name">{m}</span>
+                            {#if kind}<span class="m-kind" class:img={kind === "画图"}>{kind}</span>{/if}
                             <span class="m-check">{a.id === cfg.activeApiId && a.model === m ? "✓" : ""}</span>
                         </button>
                     {/each}
@@ -871,29 +1991,39 @@
         </div>
     {/if}
 
-    <!-- 提示词：一直平铺 -->
-    <div class="tpl-bar">
-        <span class="tpl-label">提示词</span>
-        <div class="tpl-list">
-            {#each templates as t}
-                <button
-                    class="tpl"
-                    class:active={activeTemplateId === t.id}
-                    on:click={() => bindTemplate(t.id)}
-                    title={t.content.slice(0, 120)}
-                >{t.name}</button>
-            {/each}
-            <button class="tpl add" on:click={() => openDrawer("templates")} title="新建或管理模板">+</button>
+    <!-- 生图模式提示条 -->
+    {#if imageMode}
+        <div class="img-banner">
+            <span class="ib-tag">生图</span>
+            <span>描述你想要的画面；点「优化」可以把你写的话润色成中文提示词</span>
         </div>
-    </div>
+    {/if}
 
-    <!-- MCP：常驻一行状态条 -->
-    <button class="mcp-bar" class:warn={mcpWarn} class:off={mcpOff} on:click={() => openDrawer("mcp")}>
-        <span class="dot" class:ok={!mcpWarn && !mcpOff} class:err={mcpWarn}></span>
-        <span class="mcp-text">{mcpSummary}</span>
-        <span class="grow"></span>
-        <span class="chev">›</span>
-    </button>
+    <!-- 提示词：生图模式下藏起来（图片模型不吃系统提示，留着只会点错） -->
+    {#if !imageMode}
+        <div class="tpl-bar">
+            <span class="tpl-label">提示词</span>
+            <div class="tpl-list">
+                {#each templates as t}
+                    <button
+                        class="tpl"
+                        class:active={activeTemplateId === t.id}
+                        on:click={() => bindTemplate(t.id)}
+                        title={t.content.slice(0, 120)}
+                    >{t.name}</button>
+                {/each}
+                <button class="tpl add" on:click={() => openDrawer("templates")} title="新建或管理模板">+</button>
+            </div>
+        </div>
+
+        <!-- MCP：常驻一行状态条。生图模式下也藏起来，图片模型不会调工具 -->
+        <button class="mcp-bar" class:warn={mcpWarn} class:off={mcpOff} on:click={() => openDrawer("mcp")}>
+            <span class="dot" class:ok={!mcpWarn && !mcpOff} class:err={mcpWarn}></span>
+            <span class="mcp-text">{mcpSummary}</span>
+            <span class="grow"></span>
+            <span class="chev">›</span>
+        </button>
+    {/if}
 
     {#if channelNote}
         <div class="warn-note" class:info={channelKind === "kernel"}>{channelNote}</div>
@@ -925,24 +2055,74 @@
                             {/if}
                         {/if}
                         {#if m.role === "assistant"}
-                            {#if streaming && i === messages.length - 1}
-                                <!-- 生成中先用纯文本：每来一小段就整篇重解析 Markdown 会越来越卡 -->
-                                <div class="md streaming-text">{m.content}</div>
-                            {:else}
-                                <div class="md">{@html renderMd(m.content)}</div>
+                            {#if m.images?.length}
+                                <!-- 生成的图片：一张卡片带复制 / 保存 -->
+                                {#each m.images as img, gi}
+                                    <div class="img-card">
+                                        {#if imgSrcMap[img.path || img.url || img.mem || ""]}
+                                            <img class="img-thumb" src={imgSrcMap[img.path || img.url || img.mem || ""]} alt={img.prompt || "生成的图片"} />
+                                        {:else}
+                                            <div class="img-missing">
+                                                <div>这张图暂时显示不出来</div>
+                                                {#if img.path && imgErrors[img.path]}
+                                                    <span class="tiny">原因：{imgErrors[img.path]}</span>
+                                                {:else if img.path}
+                                                    <span class="tiny">正在读取文件…</span>
+                                                {:else if img.url}
+                                                    <span class="tiny">服务商给的网址打不开，可能已过期</span>
+                                                {:else}
+                                                    <span class="tiny">这张图没有可用的本地文件或网址</span>
+                                                {/if}
+                                                {#if img.path}
+                                                    <div style="margin-top:6px">
+                                                        <button class="retry-img" on:click={() => retryImage(img.path)}>重试</button>
+                                                    </div>
+                                                {/if}
+                                            </div>
+                                        {/if}
+                                        <div class="img-body">
+                                            {#if img.prompt}
+                                                <div class="img-prompt">{img.prompt}</div>
+                                            {/if}
+                                            <div class="img-meta">
+                                                {#if img.size}{img.size}{/if}
+                                                {#if img.path} · 已存到 images/{/if}
+                                                {#if img.url && !img.path} · 服务商给的网址{/if}
+                                            </div>
+                                            <div class="img-actions">
+                                                <button on:click={() => copyImage(img)}>复制图片</button>
+                                                <button class="primary2" on:click={() => saveImageToDisk(img)}>保存到电脑</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                {/each}
                             {/if}
-                            {#if m.content && !streaming}
+                            {#if m.content}
+                                {#if streaming && i === messages.length - 1}
+                                    <!-- 生成中先用纯文本：每来一小段就整篇重解析 Markdown 会越来越卡 -->
+                                    <div class="md streaming-text">{m.content}</div>
+                                {:else}
+                                    <div class="md">{@html renderMd(m.content)}</div>
+                                {/if}
+                            {/if}
+                            {#if m.content && !streaming && !m.images?.length}
                                 <button class="copy" on:click={() => copyOne(i)}>
                                     {copiedIndex === i ? "已复制" : "复制"}
                                 </button>
                             {/if}
                         {:else}
+                            {#if m.refName}
+                                <div class="ref-chip">
+                                    <span class="ref-dot"></span>
+                                    参考图：{m.refName}
+                                </div>
+                            {/if}
                             <div class="plain">{m.content}</div>
                             <div class="mine-actions">
                                 <button class="copy" on:click={() => copyOne(i)} title="复制我发的这句话">
                                     {copiedIndex === i ? "已复制" : "复制"}
                                 </button>
-                                <button class="copy" on:click={() => resend(i)} title="把这句话原样再发一次">
+                                <button class="copy" on:click={() => resend(i)} title={imageMode ? "用这句话重新画一张" : "把这句话原样再发一次"}>
                                     重发
                                 </button>
                             </div>
@@ -952,6 +2132,8 @@
             {/each}
             {#if streaming}
                 <div class="typing">正在生成<span class="dots">…</span></div>
+            {:else if generating}
+                <div class="typing">正在画图，4K 可能要等一两分钟<span class="dots">…</span></div>
             {/if}
         </div>
 
@@ -1008,8 +2190,9 @@
         <div class="status">{statusText}</div>
     {/if}
 
-    <!-- 输入区上方：思考档位 -->
-    <div class="ctrl-bar">
+    <!-- 输入区上方：左边是思考档位，右边是生图的 4 个按钮（一直在，不分模式） -->
+    <div class="ctrl-bar" class:img={imageMode}>
+        <!-- 左：思考档位 + 退出模板 -->
         {#if canThink}
             <button class="pill" on:click={() => cycleThinking()}>思考：{levelLabels[cfg.thinking]}<span class="caret">▾</span></button>
         {:else}
@@ -1018,30 +2201,142 @@
         {#if activeTemplate}
             <button class="unbind" on:click={unbindTemplate} title="取消当前提示词规则">退出「{activeTemplate.name}」</button>
         {/if}
+
         <span class="grow"></span>
-        {#if isMobile}
-            <span class="tiny">点右下角「发送」</span>
+
+        <!-- 右：图片 / 上传 / 大小 / 尺寸 / 优化，模式开关放在最末 -->
+        <!-- 图片：打开自动保存图片的文件夹 -->
+        <button
+            class="pill folder"
+            on:click={() => void openFolder()}
+            title="打开自动保存图片的文件夹"
+        >图片</button>
+
+        <!-- 上传 -->
+        <button
+            class="pill upload"
+            class:on={!!refFile}
+            on:click={pickReference}
+            title="选一张本地图片当参考图（图生图）"
+            disabled={busyAny}
+        >{refFile ? "换图" : "上传"}</button>
+
+        <!-- 大小 -->
+        <div class="menu-anchor">
+            <button
+                class="pill"
+                class:on={imgPickerMenus === "size"}
+                on:click={(e) => { e.stopPropagation(); imgPickerMenus = imgPickerMenus === "size" ? null : "size"; }}
+                title="图片大小（长边像素）"
+                disabled={busyAny}
+            >{imageSize} <span class="caret">▾</span></button>
+            {#if imgPickerMenus === "size"}
+                <div class="menu">
+                    <div class="menu-title">图片大小（长边）</div>
+                    {#each SIZES as s}
+                        <button class="menu-item" class:active={imageSize === s} on:click={() => { pickSize(s); imgPickerMenus = null; }}>
+                            {s}
+                            <span class="px">长边 {longEdgeOf(s)}</span>
+                        </button>
+                    {/each}
+                    <div class="menu-foot">
+                        换算后：<b>{sizePlan.label}</b><br />
+                        只认固定尺寸的模型会自动换成最接近的官方尺寸。
+                    </div>
+                </div>
+            {/if}
+        </div>
+
+        <!-- 尺寸（比例） -->
+        <div class="menu-anchor">
+            <button
+                class="pill"
+                class:on={imgPickerMenus === "ratio"}
+                on:click={(e) => { e.stopPropagation(); imgPickerMenus = imgPickerMenus === "ratio" ? null : "ratio"; }}
+                title="图片比例"
+                disabled={busyAny}
+            >{imageRatio} <span class="caret">▾</span></button>
+            {#if imgPickerMenus === "ratio"}
+                <div class="menu ratio-menu">
+                    <div class="menu-title">图片比例</div>
+                    <div class="ratio-grid">
+                        {#each RATIOS as r}
+                            <button
+                                class="menu-item"
+                                class:active={imageRatio === r}
+                                on:click={() => { pickRatio(r); imgPickerMenus = null; }}
+                            >
+                                <span class="ratio-icon" style={`width:${ratioIcon(r).w}px;height:${ratioIcon(r).h}px`}></span>
+                                {r}
+                            </button>
+                        {/each}
+                    </div>
+                    <div class="menu-foot">当前：<b>{imageSize} · {imageRatio} → {sizePlan.label}</b></div>
+                </div>
+            {/if}
+        </div>
+
+        <!-- 优化 -->
+        <button class="pill opt" on:click={() => void optimizePrompt()} disabled={busyAny} title="用聊天模型把你写的话改写成中文提示词">
+            {optimizing ? "优化中…" : "优化"}
+        </button>
+
+        <!-- 模式开关：一句话切过去，切过去之后按钮还是这一排 -->
+        {#if imageMode}
+            <button class="pill mode" on:click={() => switchMode("chat")} title="切回聊天模型" disabled={busyAny}>
+                💬 对话
+            </button>
         {:else}
-            <span class="tiny">Ctrl+Enter 发送</span>
+            <button class="pill mode" on:click={() => switchMode("image")} title="切到画图模型" disabled={busyAny}>
+                🎨 生图
+            </button>
+        {/if}
+
+        <!-- 实际会出多大的图：一直显示，被官方尺寸表改过就用橙色强调 -->
+        {#if sizePlan.adjusted}
+            <span class="px-hint warn-size" title={sizePlan.note}>实际 {sizePlan.label}（已换）</span>
+        {:else}
+            <span class="px-hint">{sizePlan.label}</span>
         {/if}
     </div>
+
+    <!-- 参考图预览：选了图才出现 -->
+    {#if imageMode && (refFile || refError)}
+        <div class="ref-bar">
+            {#if refFile}
+                <span class="ref-name" title={refFile.name}>参考图：{refFile.name}</span>
+                <button class="ref-x" on:click={clearReference} title="去掉参考图">×</button>
+            {:else}
+                <span class="ref-err">{refError}</span>
+            {/if}
+        </div>
+    {/if}
 
     <!-- 输入区 -->
     <div class="compose" class:mobile={isMobile}>
         <textarea
             id="compose-input"
             bind:value={input}
-            placeholder="写内容或要求…"
+            placeholder={imageMode ? "描述你想要的画面…" : "写内容或要求…"}
             rows="3"
             enterkeyhint={isMobile ? "send" : undefined}
-            disabled={streaming}
+            disabled={streaming || generating}
         ></textarea>
-        {#if streaming}
-            <button class="danger" on:click={stop}>停止</button>
+        {#if streaming || generating}
+            <button class="danger" on:click={stopAll}>停止</button>
         {:else}
-            <button class="primary" on:click={send}>发送</button>
+            <button class="primary" on:click={send}>{imageMode ? "生成" : "发送"}</button>
         {/if}
     </div>
+
+    <!-- 选文件用的隐藏 input -->
+    <input
+        class="file-input"
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        bind:this={fileInput}
+        on:change={onReferenceChosen}
+    />
 </div>
 
 <style>
@@ -1101,6 +2396,14 @@
         border-radius: 50%;
         background: #34a853;
         flex-shrink: 0;
+    }
+    /* 画图模式：小圆点换橙色，一眼看出跟聊天不是一套 */
+    .dot-api.draw {
+        background: #e08b2d;
+    }
+    .model-btn.img {
+        border-color: #d9a25c;
+        color: #b87413;
     }
     .mb-text {
         overflow: hidden;
@@ -1221,6 +2524,29 @@
         color: var(--b3-theme-primary);
         font-weight: 600;
     }
+    /* 画图模型：橙色字 + 一个「画图」小标签，和聊天模型不会点混 */
+    .model-row.img {
+        color: #b87413;
+    }
+    .model-row.img.active {
+        color: #c8760a;
+    }
+    .model-row.bad {
+        opacity: 0.55;
+    }
+    .m-kind {
+        font-size: 9px;
+        border: 1px solid var(--b3-border-color);
+        border-radius: 6px;
+        padding: 0 4px;
+        line-height: 13px;
+        opacity: 0.75;
+        flex-shrink: 0;
+    }
+    .m-kind.img {
+        border-color: #d9a25c;
+        background: rgba(224, 139, 45, 0.12);
+    }
     .m-name {
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1296,6 +2622,29 @@
         color: var(--b3-theme-on-primary);
         font-size: 9px;
         line-height: 13px;
+    }
+
+    /* ---------- 生图模式提示条 ---------- */
+    .img-banner {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #96641a;
+        background: rgba(224, 139, 45, 0.13);
+        border-bottom: 1px solid var(--b3-border-color);
+        flex-shrink: 0;
+    }
+    .ib-tag {
+        background: #e08b2d;
+        color: #fff;
+        border-radius: 8px;
+        padding: 0 6px;
+        font-size: 10px;
+        line-height: 16px;
+        flex-shrink: 0;
     }
 
     /* ---------- 提示词：平铺 ---------- */
@@ -1580,6 +2929,108 @@
         align-self: flex-start;
     }
 
+    /* ---------- 生成的图片卡片 ---------- */
+    .img-card {
+        width: 100%;
+        border: 1px solid var(--b3-border-color);
+        border-radius: 10px;
+        overflow: hidden;
+        background: var(--b3-theme-background);
+    }
+    .img-thumb {
+        display: block;
+        width: 100%;
+        height: auto;
+        /* 4K 图直接铺满会把面板撑得老长，限个高，点开看原图的事交给「保存到电脑」 */
+        max-height: 320px;
+        object-fit: contain;
+        background: var(--b3-theme-surface);
+    }
+    .img-missing {
+        padding: 24px 12px;
+        text-align: center;
+        font-size: 11.5px;
+        line-height: 1.7;
+        color: var(--b3-theme-on-surface);
+        background: var(--b3-theme-surface);
+        opacity: 0.8;
+    }
+    .retry-img {
+        padding: 3px 12px;
+        font-size: 10.5px;
+        font-family: inherit;
+        border: 1px solid var(--b3-border-color);
+        background: var(--b3-theme-background);
+        color: var(--b3-theme-primary);
+        border-radius: 6px;
+        cursor: pointer;
+    }
+    .retry-img:hover {
+        border-color: var(--b3-theme-primary);
+    }
+    .img-body {
+        padding: 8px 10px 10px;
+    }
+    .img-prompt {
+        font-size: 11.5px;
+        line-height: 1.65;
+        color: var(--b3-theme-on-background);
+    }
+    .img-meta {
+        margin-top: 4px;
+        font-size: 10px;
+        color: var(--b3-theme-on-surface);
+        opacity: 0.75;
+        word-break: break-all;
+    }
+    .img-actions {
+        display: flex;
+        gap: 7px;
+        margin-top: 8px;
+    }
+    .img-actions button {
+        flex: 1;
+        padding: 5px 0;
+        font-size: 11.5px;
+        font-family: inherit;
+        border: 1px solid var(--b3-border-color);
+        background: var(--b3-theme-background);
+        color: var(--b3-theme-on-surface);
+        border-radius: 6px;
+        cursor: pointer;
+    }
+    .img-actions button:hover {
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-primary);
+    }
+    .img-actions button.primary2 {
+        background: var(--b3-theme-primary);
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-on-primary);
+    }
+    .img-actions button.primary2:hover {
+        filter: brightness(1.08);
+        color: var(--b3-theme-on-primary);
+    }
+    /* 我发的消息里那句"参考图：xxx" */
+    .ref-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 6px;
+        padding: 2px 7px;
+        font-size: 10.5px;
+        margin-bottom: 5px;
+    }
+    .ref-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.75);
+        flex-shrink: 0;
+    }
+
     /* ---------- 抽屉 ---------- */
     .drawer-mask {
         position: absolute;
@@ -1768,6 +3219,186 @@
     .pill.disabled {
         opacity: 0.5;
         cursor: default;
+    }
+    /* 当前生效的按钮给个淡底，一眼看出现在选的是哪档 */
+    .pill.on {
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-primary);
+        background: var(--b3-theme-surface);
+    }
+    /* 模式开关用虚线边，和功能按钮区分开 */
+    .pill.mode {
+        border-style: dashed;
+        font-weight: 500;
+    }
+    /* 「图片」按钮：打开自动保存图片的文件夹 */
+    .pill.folder {
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-primary);
+    }
+    .pill.folder:hover {
+        background: var(--b3-theme-surface);
+    }
+    .pill.upload {
+        border-color: var(--b3-theme-primary);
+        color: var(--b3-theme-primary);
+    }
+    .pill.opt {
+        border-color: #d9a25c;
+        color: #b87413;
+    }
+    .pill.opt:hover {
+        border-color: #c8760a;
+        color: #c8760a;
+    }
+    .pill:disabled {
+        opacity: 0.5;
+        cursor: default;
+        border-color: var(--b3-border-color);
+        color: var(--b3-theme-on-surface);
+    }
+    /* 生图控制条：橙色底，和聊天的灰底区分开 */
+    .ctrl-bar.img {
+        background: rgba(224, 139, 45, 0.07);
+    }
+    /* 实际尺寸提示：排在控制条最右边 */
+    .px-hint {
+        font-size: 10px;
+        color: var(--b3-theme-on-surface);
+        opacity: 0.55;
+        white-space: nowrap;
+    }
+    .warn-size {
+        color: #b87413;
+        opacity: 0.9;
+    }
+
+    /* ---------- 控制条里的下拉菜单 ---------- */
+    .menu-anchor {
+        position: relative;
+        display: inline-flex;
+    }
+    .menu {
+        position: absolute;
+        bottom: 28px;
+        left: 0;
+        z-index: 25;
+        background: var(--b3-theme-background);
+        border: 1px solid var(--b3-border-color);
+        border-radius: 10px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+        padding: 6px;
+        min-width: 150px;
+        max-height: 320px;
+        overflow-y: auto;
+    }
+    .menu.ratio-menu {
+        min-width: 232px;
+    }
+    .menu-title {
+        font-size: 10px;
+        color: var(--b3-theme-on-surface);
+        opacity: 0.7;
+        padding: 2px 6px 5px;
+    }
+    .menu-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        border: none;
+        background: none;
+        text-align: left;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        color: var(--b3-theme-on-background);
+        cursor: pointer;
+        font-family: inherit;
+    }
+    .menu-item:hover {
+        background: var(--b3-theme-surface);
+    }
+    .menu-item.active {
+        color: var(--b3-theme-primary);
+        font-weight: 600;
+    }
+    .menu-item .px {
+        margin-left: auto;
+        font-size: 10px;
+        color: var(--b3-theme-on-surface);
+        opacity: 0.65;
+        font-weight: 400;
+    }
+    .ratio-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 2px;
+    }
+    .ratio-grid .menu-item {
+        padding: 5px 7px;
+        font-size: 11.5px;
+    }
+    .ratio-icon {
+        display: inline-block;
+        border: 1.5px solid currentColor;
+        border-radius: 2px;
+        opacity: 0.5;
+        flex-shrink: 0;
+        box-sizing: border-box;
+    }
+    .menu-foot {
+        margin-top: 4px;
+        padding: 5px 6px 2px;
+        border-top: 1px solid var(--b3-border-color);
+        font-size: 10px;
+        line-height: 1.6;
+        color: var(--b3-theme-on-surface);
+    }
+
+    /* 参考图预览条 */
+    .ref-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 12px;
+        font-size: 10.5px;
+        background: var(--b3-theme-surface);
+        border-top: 1px solid var(--b3-border-color);
+        flex-shrink: 0;
+    }
+    .ref-name {
+        color: var(--b3-theme-on-surface);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+    }
+    .ref-err {
+        color: var(--b3-theme-error);
+        line-height: 1.5;
+    }
+    .ref-x {
+        border: none;
+        background: none;
+        color: var(--b3-theme-on-surface);
+        font-size: 14px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0 2px;
+        flex-shrink: 0;
+    }
+    .ref-x:hover {
+        color: var(--b3-theme-error);
+    }
+    /* 选文件用的 input 必须藏起来，但不能用 display:none —— 有的 WebView 里点不动 */
+    .file-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+        left: -9999px;
     }
     .unbind {
         border: 1px solid var(--b3-border-color);
