@@ -446,7 +446,7 @@ Unrecognised errors keep the original text so you can search it.
 
 ```powershell
 npm install
-npm test                 # 1459 assertions across 49 files
+npm test                 # 1496 assertions across 50 files
 npm run build            # build into dist/
 npm run pack             # build + create the installable zip
 npm run install-plugin   # build + copy into your SiYuan workspace

@@ -32,7 +32,8 @@ exports.startRequest = function startRequest(options, onEvent) {
         useSessionCookies: false,
     });
 
-    const decoder = new StringDecoder('utf8');
+    const decoder = options.binary ? null : new StringDecoder('utf8');
+    const binChunks = options.binary ? [] : null;
     let finished = false;
 
     const cleanup = () => { owner.removeListener('destroyed', abort); };
@@ -64,6 +65,10 @@ exports.startRequest = function startRequest(options, onEvent) {
         response.on('aborted', () => fail(new Error('连接被中断')));
         response.on('data', (chunk) => {
             if (finished) return;
+            if (binChunks) {
+                binChunks.push(Buffer.from(chunk));
+                return;
+            }
             const text = decoder.write(chunk);
             if (text) send('data', text);
         });
@@ -71,6 +76,13 @@ exports.startRequest = function startRequest(options, onEvent) {
             if (finished) return;
             finished = true;
             cleanup();
+            if (binChunks) {
+                // 二进制响应整包按 base64 回传，避免 UTF-8 解码把图片字节毁掉
+                const b64 = Buffer.concat(binChunks).toString('base64');
+                if (b64) send('binary', b64);
+                send('end');
+                return;
+            }
             const tail = decoder.end();
             if (tail) send('data', tail);
             send('end');

@@ -4,7 +4,7 @@
 
 Current version: **1.4.0** ｜ [中文版](TESTING.md)
 
-**Current size: 49 test files / 1459 assertions, all passing.**
+**Current size: 50 test files / 1496 assertions, all passing.**
 
 ---
 
@@ -305,11 +305,11 @@ node -e "const fs=require('fs');const p='Z:/siyuan/data/plugins/siyuan-plugin-ai
 
 ## 10. What the numbers mean
 
-**1459 assertions across 49 files** (v1.4.0).
+**1496 assertions across 50 files** (v1.4.0).
 
 The count is not the goal, but it does show one thing: the bigger the change, the more "same input must give same output" assertions are needed to hold it.
 
-This round grew from 841 to 1459, and the additions are all places that previously required clicking by hand or guessing:
+This round grew from 841 to 1496, and the additions are all places that previously required clicking by hand or guessing:
 
 - What the generation request body actually is (`/images/generations` vs `/edits`, whether multipart has a boundary)
 - Whether the size maths is right (1K + 16:9 must be exactly 1920×1080)

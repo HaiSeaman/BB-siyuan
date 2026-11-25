@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = dirname(here);
 const nodeModules = join(root, "node_modules");
-const mainDir = "D:\\AI\\Github\\BBS\\BBS\\siyuan-plugin-ai-chat";
+const mainDir = "D:\\AI\\Github\\BBS\\BBS\\BB-siyuan";
 const mainModules = join(mainDir, "node_modules");
 
 function line(text = "") {

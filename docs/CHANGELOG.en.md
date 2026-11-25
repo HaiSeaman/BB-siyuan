@@ -189,7 +189,7 @@ Now three groups are kept: **ticked** + **image models** + **active**. Only mode
 
 ### Tests
 
-**49 files / 1459 assertions** (v1.3.0 was 33 / 841).
+**50 files / 1496 assertions** (v1.3.0 was 33 / 841).
 
 The additions all verify things that previously required clicking by hand or guessing: the generation request body, size maths, image types, late results after Stop, clearing models while keeping ticked ones, and where the Images button actually points.
 

@@ -214,14 +214,19 @@ function geminiBody(
         if (!m || m.role === "system") continue;
 
         if (m.role === "tool") {
-            // 工具结果要用 functionResponse，按官方格式还原
+            // 工具结果要用 functionResponse，连续多个工具结果合并到同一条 user 回合里
             const part = {
                 functionResponse: {
                     name: m.tool_name || "tool",
                     response: { result: String(m.content ?? "") },
                 },
             };
-            contents.push({ role: "user", parts: [part] });
+            const prev = contents[contents.length - 1];
+            if (prev?.role === "user" && prev.parts.every((p: any) => p.functionResponse)) {
+                prev.parts.push(part);
+            } else {
+                contents.push({ role: "user", parts: [part] });
+            }
             continue;
         }
 

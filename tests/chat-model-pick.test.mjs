@@ -6,7 +6,7 @@
  * 而用户完全不知道为什么。
  */
 import { initSettings, snapshot, chatApiFor, packModelRef, unpackModelRef } from "../.test/settings.js";
-import { isChatModel, isImageModel, modelKindLabel, fetchModels, splitChatModels } from "../.test/apis.js";
+import { isChatModel, isImageModel, modelKindLabelOf, fetchModels, splitChatModels } from "../.test/apis.js";
 
 let pass = 0;
 let fail = 0;
@@ -50,9 +50,10 @@ console.log("模型名分类：");
     check("带 vl 的不算画图", isImageModel("qwen-vl-max"), false);
     check("带 chat 的不算画图", isImageModel("flux-chat"), false);
 
-    check("标签：画图", modelKindLabel("gpt-image-1"), "画图");
-    check("标签：不能聊天", modelKindLabel("text-embedding-3-small"), "不能聊天");
-    check("标签：聊天模型没有标签", modelKindLabel("glm-5.3"), "");
+    check("标签：画图", modelKindLabelOf("gpt-image-1", []), "画图");
+    check("标签：手动标为画图", modelKindLabelOf("custom-draw", ["custom-draw"]), "画图");
+    check("标签：不能聊天", modelKindLabelOf("text-embedding-3-small", []), "不能聊天");
+    check("标签：聊天模型没有标签", modelKindLabelOf("glm-5.3", []), "");
 }
 
 console.log("拉取时画图模型要留下来：");

@@ -110,7 +110,7 @@ so ticking five left you with one.)
 ### 7. Docs and tests
 
 - README, architecture, testing guide, changelog, and release notes are **bilingual**
-- **49 test files / 1459 assertions** (previous: 33 / 841)
+- **50 test files / 1496 assertions** (previous: 33 / 841)
 
 ### Upgrade notes
 

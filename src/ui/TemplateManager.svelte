@@ -16,6 +16,7 @@
     let editingId: string | null = null;
     let editName = "";
     let editContent = "";
+    let formError = "";
     let confirmDeleteId: string | null = null;
 
     /** 本地镜像。父组件回传 props 有延迟，直接依赖 props 会读到旧值 */
@@ -35,6 +36,7 @@
         editingId = t.id;
         editName = t.name;
         editContent = t.content;
+        formError = "";
     }
 
     function startEdit(id: string) {
@@ -43,25 +45,28 @@
         editingId = id;
         editName = t.name;
         editContent = t.content;
+        formError = "";
     }
 
     function saveEdit() {
         if (!editingId) return;
         const name = editName.trim();
         if (!name) {
-            alert("模板名不能空");
+            formError = "模板名不能空";
             return;
         }
         if (!editContent.trim()) {
-            alert("模板正文不能空");
+            formError = "模板正文不能空";
             return;
         }
+        formError = "";
         commit(updateTemplate(list, editingId, { name, content: editContent }));
         editingId = null;
     }
 
     function cancelEdit() {
         editingId = null;
+        formError = "";
     }
 
     function askDelete(id: string) {
@@ -115,6 +120,9 @@
             </small>
         </div>
 
+        {#if formError}
+            <div class="warn">{formError}</div>
+        {/if}
         <button class="primary" on:click={saveEdit}>保存</button>
     {:else}
         <div class="hint-box">
@@ -299,6 +307,12 @@
         cursor: pointer;
         font-size: 12px;
         padding: 0;
+    }
+    .warn {
+        font-size: 11px;
+        line-height: 1.6;
+        color: var(--b3-theme-error);
+        margin-bottom: 10px;
     }
     .mask {
         position: absolute;

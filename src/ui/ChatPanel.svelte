@@ -173,6 +173,8 @@
     let refThumbs: Record<string, string> = {};
     let optimizing = false;
     let generating = false;
+    let optAbort: { abort: () => void } | null = null;
+    let confirmClearHist: { count: number; imgNote: string; paths: string[] } | null = null;
     /** 正在等回复的那张图（占位用） */
     let imgPickerMenus: "size" | "ratio" | null = null;
 
@@ -205,6 +207,13 @@
             try {
                 genAbort.abort();
             } catch {}
+        }
+        // 优化提示词这一轮也要掐掉
+        if (optAbort) {
+            try {
+                optAbort.abort();
+            } catch {}
+            optAbort = null;
         }
         // 聊天这一轮也要掐掉：不然面板已经销毁了，流还在跑，
         // 每一小段都往已销毁的组件里写状态（白耗流量，控制台一堆错）
@@ -280,12 +289,20 @@
         };
         currentSessionId = session.id;
 
-        sessions = upsertSession(sessions, session).slice(0, 30);
+        const nextSessions = upsertSession(sessions, session);
+        const evicted = nextSessions.slice(30);
+        sessions = nextSessions.slice(0, 30);
         persistSessions(sessions);
+        if (evicted.length) {
+            // 超过 30 条被挤掉的旧会话：把不再被保留会话用到的图一并清理，免得占满硬盘
+            const kept = new Set(collectImagePaths(sessions));
+            const gone = collectImagePaths(evicted).filter((p) => !kept.has(p));
+            void removeImageFiles(gone);
+        }
     }
 
     function openSession(id: string) {
-        if (streaming) {
+        if (busyAny) {
             statusText = "正在生成，先点「停止」再切换对话";
             return;
         }
@@ -300,6 +317,7 @@
             refName: m.refName,
         }));
         drawer = null;
+        confirmClearHist = null;
         statusText = "";
         activeTemplateId = null;
         // 下标换了，之前展开的思考区要重置，否则会串到别的消息上
@@ -316,9 +334,10 @@
     function deleteSession(id: string) {
         // 先把这个会话用到的图片文件删掉，否则磁盘上会攒一堆没主的图
         const doomed = sessions.find((s) => s.id === id);
-        const paths = collectImagePaths(doomed ? [doomed] : []);
         sessions = removeSession(sessions, id);
         persistSessions(sessions);
+        const kept = new Set(collectImagePaths(sessions));
+        const paths = collectImagePaths(doomed ? [doomed] : []).filter((p) => !kept.has(p));
         if (currentSessionId === id) {
             currentSessionId = "";
             messages = [];
@@ -358,9 +377,9 @@
         refThumbs = next;
     }
 
-    /** 一键清空所有历史对话（当前正在聊的内容也一起清，不然会马上又被存回来） */
+    /** 一键清空所有历史对话（先在抽屉内二次确认，避免原生 confirm 弹窗卡住焦点） */
     function clearAllSessions() {
-        if (streaming || generating) {
+        if (busyAny) {
             statusText = "正在生成，先点「停止」再清空历史";
             return;
         }
@@ -384,8 +403,13 @@
         };
         const paths = collectImagePaths([...sessions, inUse]);
         const imgNote = paths.length ? `，同时删掉 ${paths.length} 张图片文件` : "";
-        if (!confirm(`清空全部 ${count} 个历史对话${imgNote}？删掉就找不回来了。`)) return;
+        confirmClearHist = { count, imgNote, paths };
+    }
 
+    function confirmDoClearHist() {
+        if (!confirmClearHist) return;
+        const { count, imgNote, paths } = confirmClearHist;
+        confirmClearHist = null;
         sessions = [];
         persistSessions(sessions);
         // 当前对话如果不清，下一次生成会把它重新存成一条历史，看起来像“没删干净”
@@ -397,6 +421,10 @@
         setTimeout(() => {
             if (statusText.startsWith("已清空")) statusText = "";
         }, 3000);
+    }
+
+    function cancelClearHist() {
+        confirmClearHist = null;
     }
 
     async function connectMcp() {
@@ -584,7 +612,7 @@
      *   3. 拿到的图片字节存进插件数据目录的 images/，对话里只记路径
      *   4. 存不下来（比如路径不可写）也要显示出来，不能白花钱
      */
-    async function generateImage(prompt: string) {
+    async function generateImage(prompt: string, replaceAt?: number) {
         if (generating) return;
         const text = String(prompt || "").trim();
         if (!text) {
@@ -602,24 +630,43 @@
             return;
         }
 
+        const isResend = typeof replaceAt === "number";
         const plan = planSize(imageSize, imageRatio, runApi.model);
         const n = 1;
-        const runRef = refFile ? { ...refFile } : null;
+        const runRef = isResend ? null : refFile ? { ...refFile } : null;
 
-        // 先插消息：用户那句 + 空的回答占位
-        const userIndex = messages.length;
-        messages = [
-            ...messages,
-            {
-                role: "user",
-                content: text,
-                reasoning: "",
-                refName: runRef?.name,
-            },
-            { role: "assistant", content: "", reasoning: "" },
-        ];
-        input = "";
-        refFile = null;
+        let userIndex = messages.length;
+        if (isResend) {
+            userIndex = replaceAt!;
+            // 重发：原地清空这一条的旧回答，绝不在末尾追加重复气泡，也不截断后面的对话
+            if (messages[userIndex + 1]?.role === "assistant") {
+                messages[userIndex + 1].content = "";
+                messages[userIndex + 1].images = [];
+                messages[userIndex + 1].reasoning = "";
+                messages = messages;
+            } else {
+                messages = [
+                    ...messages.slice(0, userIndex + 1),
+                    { role: "assistant", content: "", reasoning: "" },
+                    ...messages.slice(userIndex + 1),
+                ];
+            }
+        } else {
+            // 新发：在末尾插一对「我问 + 空回答占位」
+            messages = [
+                ...messages,
+                {
+                    role: "user",
+                    content: text,
+                    reasoning: "",
+                    refName: runRef?.name,
+                },
+                { role: "assistant", content: "", reasoning: "" },
+            ];
+            input = "";
+            refFile = null;
+        }
+
         generating = true;
         genAbort = new AbortController();
         // 记住这一轮的 controller：用户点停止后，晚到的结果不能再往界面里写
@@ -637,13 +684,14 @@
 
             const result = await requestImages(runApi, text, plan.api, n, runRef, myAbort.signal);
             // 用户已经点了停止：结果直接丢掉，别把"停止前的半张图"塞进对话。
-            // 占位的那条 assistant 也要删掉 —— 否则界面上留一个空气泡，
-            // 而存档又会把它过滤掉，两边不一致。
+            // 新发时把占位的空白 assistant 删掉（重发时不能截断后面的对话）。
             if (isStopped()) {
                 const ph = messages[answerIndex];
                 if (ph && !ph.images?.length && !ph.content.trim()) {
-                    messages = messages.slice(0, answerIndex);
-                    messages = messages;
+                    if (!isResend) {
+                        messages = messages.slice(0, answerIndex);
+                        messages = messages;
+                    }
                 }
                 return;
             }
@@ -711,9 +759,9 @@
             } else {
                 statusText = explainImageError(msg);
             }
-            // 失败就把占位删掉，别留一条空白回答
+            // 新发失败时删掉末尾空占位；重发时不动后面的消息
             const target = messages[answerIndex];
-            if (target && !target.images?.length && !target.content.trim()) {
+            if (!isResend && target && !target.images?.length && !target.content.trim()) {
                 messages = messages.slice(0, answerIndex);
                 messages = messages;
             }
@@ -916,9 +964,13 @@
 
             let out = "";
             let settled = false;
+            let timer: any = null;
+            let handle: { abort: () => void } | null = null;
             const done = (err?: string) => {
                 if (settled) return;
                 settled = true;
+                if (timer) clearTimeout(timer);
+                if (handle && optAbort === handle) optAbort = null;
                 if (err) reject(new Error(err));
                 else resolve(out);
             };
@@ -946,7 +998,7 @@
                 return;
             }
 
-            const handle = streamChat(
+            handle = streamChat(
                 {
                     url: endpointFor(apiCfg.protocol, apiCfg.baseURL, model),
                     headers: headersFor(apiCfg.protocol, apiCfg),
@@ -973,12 +1025,13 @@
                     },
                 }
             );
+            optAbort = handle;
 
             // 兜底：90 秒还没结果就放弃，避免按钮一直转
-            setTimeout(() => {
+            timer = setTimeout(() => {
                 if (settled) return;
                 try {
-                    handle.abort();
+                    handle?.abort();
                 } catch {}
                 done("优化超时（90 秒没有回应）");
             }, 90000);
@@ -1029,6 +1082,7 @@
 
         const updates: Record<string, string> = {};
         const errs: Record<string, string> = {};
+        let pathFixed = false;
         for (const p of need) {
             try {
                 const d = await loadImageDataUrl(pluginName, p);
@@ -1043,7 +1097,10 @@
                     // 把会话里的路径也改过去，下次打开就直接能读
                     for (const m of messages) {
                         for (const img of m.images || []) {
-                            if (img.path === p) img.path = alt.path;
+                            if (img.path === p) {
+                                img.path = alt.path;
+                                pathFixed = true;
+                            }
                         }
                     }
                     messages = messages;
@@ -1056,6 +1113,7 @@
         }
         if (Object.keys(updates).length) refThumbs = { ...refThumbs, ...updates };
         if (Object.keys(errs).length) imgErrors = { ...imgErrors, ...errs };
+        if (pathFixed) saveCurrentSession();
     }
 
     /** 手动重试一次：清掉失败记录再读 */
@@ -1135,17 +1193,23 @@
             if (dec) return dec;
         }
         if (img.url) {
-            try {
-                const r = await fetchBinary(img.url, { method: "GET", headers: {} });
-                if (r.ok) {
-                    const bytes = await r.bytes();
-                    // 以字节为准：服务商"图片网址"有时返回的是 JSON 错误体，
-                    // 直接当图片存下去会得到一个打不开的文件
-                    const sniffed = sniffImageMime(bytes, "");
-                    if (!sniffed) return null;
-                    return { bytes, mime: sniffed };
-                }
-            } catch {}
+            // 小于 20KB 的内嵌 data URL 会留在 url 字段里，直接解码，不走 HTTP 代理
+            if (/^data:/i.test(img.url)) {
+                const dec = dataUrlToBytes(img.url);
+                if (dec) return dec;
+            } else {
+                try {
+                    const r = await fetchBinary(img.url, { method: "GET", headers: {} });
+                    if (r.ok) {
+                        const bytes = await r.bytes();
+                        // 以字节为准：服务商"图片网址"有时返回的是 JSON 错误体，
+                        // 直接当图片存下去会得到一个打不开的文件
+                        const sniffed = sniffImageMime(bytes, "");
+                        if (!sniffed) return null;
+                        return { bytes, mime: sniffed };
+                    }
+                } catch {}
+            }
         }
         // 存盘失败的那张：用它自己携带的内存副本
         if (img.mem) {
@@ -1261,6 +1325,7 @@
     /** 打开抽屉时顺手把模型切换器收掉，避免两层叠在一起 */
     function openDrawer(which: typeof drawer) {
         modelPicker = false;
+        confirmClearHist = null;
         drawer = which;
     }
 
@@ -1319,12 +1384,21 @@
     /** Lute 实例建一次就够，每次新建+整篇重解析会随着内容变长越来越卡 */
     let luteInstance: any = null;
 
+    /** 过滤危险标签与内联事件脚本，防外部 MCP 网页或模型回复里夹带恶意 HTML */
+    function sanitizeHtml(html: string): string {
+        return String(html || "")
+            .replace(/<\s*(script|iframe|object|embed|style|meta|link|base)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
+            .replace(/<\s*(script|iframe|object|embed|style|meta|link|base)\b[^>]*\/?>/gi, "")
+            .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+            .replace(/(href|src|xlink:href)\s*=\s*(["'])\s*(?:javascript:|vbscript:|data\s*:\s*text\/html)[\s\S]*?\2/gi, '$1=$2#$2');
+    }
+
     function renderMd(text: string): string {
         try {
             if (luteInstance === null) {
                 luteInstance = (window as any).Lute?.New?.() || false;
             }
-            if (luteInstance && luteInstance.Md2HTML) return luteInstance.Md2HTML(text);
+            if (luteInstance && luteInstance.Md2HTML) return sanitizeHtml(luteInstance.Md2HTML(text));
         } catch {}
         return text.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" } as any)[c]);
     }
@@ -1514,9 +1588,13 @@
 
         return (msgs: any[], tools: any[], handlers: any): Promise<{ content: string; toolCalls: any[] }> => {
             return new Promise((resolve, reject) => {
+                let roundContent = "";
                 const parser = new ProviderParser(
                     runApi.protocol,
-                    (t) => handlers.onDelta({ content: t }),
+                    (t) => {
+                        roundContent += t;
+                        handlers.onDelta({ content: t });
+                    },
                     (t) => handlers.onDelta({ reasoning: t })
                 );
 
@@ -1536,8 +1614,9 @@
                         reject(new Error(err));
                         return;
                     }
+                    // 把这一轮模型吐出的文字一起带回工具循环，保证下一轮历史记忆完整
                     resolve({
-                        content: "",
+                        content: roundContent,
                         toolCalls: parser.toolCalls(),
                     });
                 };
@@ -1620,7 +1699,7 @@
      * 绑定之后，这个框里每一条消息都会自动带上这套规则去问模型。
      */
     function bindTemplate(id: string) {
-        if (streaming) {
+        if (busyAny) {
             statusText = "正在生成，等这一轮结束再换模板";
             return;
         }
@@ -1720,21 +1799,11 @@
             return;
         }
 
-        // 生图：重画一张，把原来那张图替换掉
+        // 生图：原地重画这一条替换旧图，不再额外追加气泡
         if (imageMode) {
-            if (messages[i + 1]?.role === "assistant") {
-                messages[i + 1].content = "";
-                messages[i + 1].images = [];
-                messages[i + 1].reasoning = "";
-                messages = messages;
-            } else {
-                messages = [
-                    ...messages.slice(0, i + 1),
-                    { role: "assistant", content: "", reasoning: "" },
-                    ...messages.slice(i + 1),
-                ];
-            }
-            void generateImage(text);
+            openReasoning = -1;
+            copiedIndex = -1;
+            void generateImage(text, i);
             return;
         }
 
@@ -1784,7 +1853,7 @@
 
     /** 取消当前绑定的模板，回到没规则的自由对话 */
     function unbindTemplate() {
-        if (streaming) {
+        if (busyAny) {
             statusText = "正在生成，等这一轮结束再取消模板";
             return;
         }
@@ -2147,7 +2216,7 @@
                 </div>
                 <div class="drawer-body">
                     {#if drawer === "settings"}
-                        <SettingsPanel {persist} busy={streaming} />
+                        <SettingsPanel {persist} busy={busyAny} />
                     {:else if drawer === "templates"}
                         <TemplateManager {templates} onChange={onTemplatesChanged} />
                     {:else if drawer === "mcp"}
@@ -2162,9 +2231,19 @@
                         <div class="hist-list">
                             <button class="new-chat" on:click={() => { newChat(); drawer = null; }}>+ 新对话</button>
                             {#if sessions.length}
-                                <button class="clear-hist" on:click={clearAllSessions}>
-                                    清空全部历史（{sessions.length} 个）
-                                </button>
+                                {#if confirmClearHist}
+                                    <div class="confirm-hist">
+                                        <span>清空全部 {confirmClearHist.count} 个历史对话{confirmClearHist.imgNote}？删掉就找不回来了。</span>
+                                        <div class="confirm-hist-btns">
+                                            <button class="confirm-hist-no" on:click={cancelClearHist}>取消</button>
+                                            <button class="confirm-hist-yes" on:click={confirmDoClearHist}>确认清空</button>
+                                        </div>
+                                    </div>
+                                {:else}
+                                    <button class="clear-hist" on:click={clearAllSessions}>
+                                        清空全部历史（{sessions.length} 个）
+                                    </button>
+                                {/if}
                             {/if}
                             {#if sessions.length === 0}
                                 <div class="hist-empty">还没有历史对话。聊过一次就会自动存下来。</div>
@@ -3119,6 +3198,35 @@
         border-color: var(--b3-theme-error);
         color: var(--b3-theme-error);
         opacity: 1;
+    }
+    .confirm-hist {
+        padding: 8px;
+        margin-bottom: 8px;
+        border: 1px solid var(--b3-theme-error);
+        border-radius: var(--b3-border-radius);
+        font-size: 11px;
+        line-height: 1.6;
+    }
+    .confirm-hist-btns {
+        display: flex;
+        justify-content: flex-end;
+        gap: 6px;
+        margin-top: 6px;
+    }
+    .confirm-hist-no,
+    .confirm-hist-yes {
+        border: 1px solid var(--b3-border-color);
+        background: none;
+        border-radius: 4px;
+        padding: 3px 9px;
+        font-size: 11px;
+        cursor: pointer;
+        font-family: inherit;
+    }
+    .confirm-hist-yes {
+        border-color: var(--b3-theme-error);
+        background: var(--b3-theme-error);
+        color: #fff;
     }
     .hist-empty {
         font-size: 11px;

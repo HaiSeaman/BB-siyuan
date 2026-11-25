@@ -423,6 +423,12 @@ console.log("设置页点模型名必须切换当前 API：");
                 const beforeChips = card.querySelectorAll(".model-chip").length;
                 clickIn(clearBtn2);
                 await tick();
+                const confirmClearBtn = localAll(".drawer .api-card").pop().querySelector(".confirm-yes");
+                ok("出现内联确认清除按钮", !!confirmClearBtn);
+                if (confirmClearBtn) {
+                    clickIn(confirmClearBtn);
+                    await tick();
+                }
                 const nowCard = localAll(".drawer .api-card").pop();
                 const afterChips = nowCard.querySelectorAll(".model-chip").length;
                 ok("点清除后模型变少", afterChips < beforeChips, beforeChips + " → " + afterChips);
@@ -468,15 +474,20 @@ console.log("历史对话一键清空：");
     ok("按钮上写了几条", /2 个/.test(clearHist?.textContent || ""), clearHist?.textContent);
 
     if (clearHist) {
-        window.confirm = () => true;
         clickIn(clearHist);
         await tick();
+        const confirmYes = local(".drawer .confirm-hist-yes");
+        ok("出现内联确认清空按钮", !!confirmYes);
+        if (confirmYes) {
+            clickIn(confirmYes);
+            await tick();
+        }
         ok("历史被清空了", localAll(".drawer .hist-item").length === 0, "还剩 " + localAll(".drawer .hist-item").length);
         ok("显示了已清空提示", /已清空/.test(local(".status")?.textContent || ""), local(".status")?.textContent);
         ok("清完界面还在（没崩）", !!local(".panel"));
     }
 
-    // 点取消（confirm 返回 false）时不能删掉任何东西
+    // 点取消时不能删掉任何东西
     const host6 = document.createElement("div");
     document.body.appendChild(host6);
     const p6 = new ChatPanel({
@@ -494,12 +505,17 @@ console.log("历史对话一键清空：");
         .find((b) => (b.textContent || "").includes("历史"))
         ?.dispatchEvent(new window.Event("click", { bubbles: true }));
     await tick();
-    window.confirm = () => false; // 用户点了「取消」
-    const cancelBtn = l6(".drawer .clear-hist");
-    ok("取消测试找到了按钮", !!cancelBtn);
-    if (cancelBtn) {
-        cancelBtn.dispatchEvent(new window.Event("click", { bubbles: true }));
+    const cancelTrigger = l6(".drawer .clear-hist");
+    ok("取消测试找到了按钮", !!cancelTrigger);
+    if (cancelTrigger) {
+        cancelTrigger.dispatchEvent(new window.Event("click", { bubbles: true }));
         await tick();
+        const cancelBtn = l6(".drawer .confirm-hist-no");
+        ok("取消测试出现了内联取消按钮", !!cancelBtn);
+        if (cancelBtn) {
+            cancelBtn.dispatchEvent(new window.Event("click", { bubbles: true }));
+            await tick();
+        }
         ok("点了取消，历史一条都没少", l6all(".drawer .hist-item").length === 1, "实际 " + l6all(".drawer .hist-item").length);
     }
     p6.$destroy();

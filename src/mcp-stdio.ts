@@ -54,9 +54,19 @@ export class StdioMcpClient {
 
     private start() {
         if (this.child) return;
+        const baseEnv = (globalThis as any).process?.env;
+        const hasCustom = Boolean(this.opts.env && Object.keys(this.opts.env).length > 0);
+        // 拿不到进程 env 且用户也没配额外变量时，不传 env 让 spawn 继承父环境，避免传成 {} 抹掉 PATH
+        const env = baseEnv
+            ? hasCustom
+                ? { ...baseEnv, ...this.opts.env }
+                : baseEnv
+            : hasCustom
+            ? this.opts.env
+            : undefined;
         // 起不来就让错误直接冒出去，别吞掉
         const child = this.opts.spawn(this.opts.command, this.opts.args || [], {
-            env: { ...(globalThis as any).process?.env, ...(this.opts.env || {}) },
+            env,
             cwd: this.opts.cwd,
             stdio: ["pipe", "pipe", "pipe"],
         });

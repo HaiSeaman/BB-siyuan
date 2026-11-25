@@ -39,10 +39,21 @@ interface ElectronBridge {
             body?: string;
             /** 二进制请求体（base64）。与 body 二选一 */
             bodyBase64?: string;
+            /** 为 true 时主进程按 base64 原样回传响应字节，避免图片等二进制被 UTF-8 解码破坏 */
+            binary?: boolean;
             owner: any;
         },
         onEvent: (type: string, value: any) => void
     ) => RequestHandle;
+}
+
+/** 把 base64 字符串还原成原始字节 */
+function base64ToBytes(b64: string): Uint8Array {
+    if (!b64) return new Uint8Array(0);
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
 }
 
 /** 当前实际使用的通道 */
@@ -375,11 +386,19 @@ export async function fetchBinary(
 function runNativeRequest(
     native: { bridge: ElectronBridge; owner: any },
     url: string,
-    opts: { method: string; headers: Record<string, string>; body?: string; rawBody?: Uint8Array; signal?: AbortSignal },
+    opts: {
+        method: string;
+        headers: Record<string, string>;
+        body?: string;
+        rawBody?: Uint8Array;
+        binary?: boolean;
+        signal?: AbortSignal;
+    },
     timeoutMs: number
-): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: string }> {
+): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: string; bytes: Uint8Array }> {
     return new Promise((resolve, reject) => {
-        let chunks: string[] = [];
+        const chunks: string[] = [];
+        const binaryChunks: string[] = [];
         let statusCode = 0;
         const headers = new Map<string, string>();
         let settled = false;
@@ -392,11 +411,16 @@ function runNativeRequest(
             // 正常结束也要清掉兜底超时，否则闭包会多持有定时器
             if (timeoutTimer) clearTimeout(timeoutTimer);
             if (err) return reject(new Error(err));
+            // 收到 binary 事件就按 base64 还原真实字节；否则沿用文本通道（兼容仅回 data 的旧代理/测试桩）
+            const hasBinary = binaryChunks.length > 0;
+            const bytes = hasBinary ? base64ToBytes(binaryChunks.join("")) : new TextEncoder().encode(chunks.join(""));
+            const text = hasBinary ? new TextDecoder().decode(bytes) : chunks.join("");
             resolve({
                 ok: statusCode >= 200 && statusCode < 300,
                 status: statusCode,
                 headers,
-                text: chunks.join(""),
+                text,
+                bytes,
             });
         };
 
@@ -407,6 +431,7 @@ function runNativeRequest(
                 headers: opts.headers,
                 body: opts.rawBody ? undefined : opts.body,
                 bodyBase64: opts.rawBody && opts.rawBody.length ? bytesToBase64(opts.rawBody) : undefined,
+                binary: opts.binary,
                 owner: native.owner,
             },
             (type, value) => {
@@ -417,6 +442,8 @@ function runNativeRequest(
                         const key = k.toLowerCase();
                         headers.set(key, Array.isArray(v) ? String(v[0]) : String(v));
                     }
+                } else if (type === "binary") {
+                    binaryChunks.push(String(value));
                 } else if (type === "data") {
                     chunks.push(String(value));
                 } else if (type === "end") {
@@ -475,14 +502,12 @@ function fetchBinaryViaNative(
     url: string,
     opts: { method: string; headers: Record<string, string>; body?: string; rawBody?: Uint8Array; timeoutMs?: number; signal?: AbortSignal }
 ): Promise<{ ok: boolean; status: number; headers: Map<string, string>; text: () => Promise<string>; bytes: () => Promise<Uint8Array> }> {
-    return runNativeRequest(native, url, opts, opts.timeoutMs ?? 300000).then((r) => ({
+    return runNativeRequest(native, url, { ...opts, binary: true }, opts.timeoutMs ?? 300000).then((r) => ({
         ok: r.ok,
         status: r.status,
         headers: r.headers,
         text: async () => r.text,
-        // 主进程那条通道回传的是文本；图片本来就以 base64 JSON 回来，
-        // 所以这里把文本重新编成字节，交给上层统一处理
-        bytes: async () => new TextEncoder().encode(r.text),
+        bytes: async () => r.bytes,
     }));
 }
 
@@ -615,6 +640,7 @@ function streamViaNative(
         abort: () => {
             if (settled) return;
             settled = true;
+            clearTimeout(idleTimer);
             stopUnderlying();
             // 必须回调：否则调用方的 Promise 永远没有出口
             handlers.onEnd("已停止", 0);

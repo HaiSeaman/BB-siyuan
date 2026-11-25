@@ -19,6 +19,7 @@
     let headerText = "";
     let argsText = "";
     let envText = "";
+    let formError = "";
     let confirmDeleteId: string | null = null;
     let testing = false;
 
@@ -49,6 +50,7 @@
         headerText = "";
         argsText = "";
         envText = "";
+        formError = "";
     }
 
     function startEdit(s: McpServer) {
@@ -57,10 +59,14 @@
         headerText = Object.entries(s.headers || {})
             .map(([k, v]) => k + ": " + v)
             .join("\n");
-        argsText = (s.args || []).join(" ");
+        // 带空格或引号的参数还原回双引号包裹，否则下次保存会被空格劈碎
+        argsText = (s.args || [])
+            .map((a) => (/[\s"']/.test(a) || a === "" ? `"${a.replace(/"/g, "")}"` : a))
+            .join(" ");
         envText = Object.entries(s.env || {})
             .map(([k, v]) => k + "=" + v)
             .join("\n");
+        formError = "";
     }
 
     function parseHeaders(text: string): Record<string, string> {
@@ -91,18 +97,19 @@
         if (!draft) return;
         const name = draft.name.trim();
         if (!name) {
-            alert("给这个服务器起个名字");
+            formError = "给这个服务器起个名字";
             return;
         }
         if ((draft.type === "http" || draft.type === "sse") && !draft.url.trim()) {
-            alert("HTTP / SSE 类型要填地址");
+            formError = "HTTP / SSE 类型要填地址";
             return;
         }
         if (draft.type === "stdio" && !draft.command.trim()) {
-            alert("本地命令类型要填启动命令");
+            formError = "本地命令类型要填启动命令";
             return;
         }
 
+        formError = "";
         const final: McpServer = {
             ...draft,
             name,
@@ -122,6 +129,7 @@
     function cancelEdit() {
         editingId = null;
         draft = null;
+        formError = "";
     }
 
     function toggle(s: McpServer) {
@@ -209,6 +217,9 @@
             {/if}
         {/if}
 
+        {#if formError}
+            <div class="warn">{formError}</div>
+        {/if}
         <button class="primary" on:click={save}>保存</button>
     {:else}
         <div class="hint-box">

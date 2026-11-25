@@ -36,6 +36,7 @@ const files = [
     "net-kernel.test.mjs",
     "net-native-merged.test.mjs",
     "review-fixes.test.mjs",
+    "audit-fixes.test.mjs",
     "template.test.mjs",
     "templates-store.test.mjs",
     "turnplan.test.mjs",

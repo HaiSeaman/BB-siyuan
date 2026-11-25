@@ -49,6 +49,8 @@
     let testResult: Record<string, string> = {};
     let pulling: Record<string, boolean> = {};
     let newModelText: Record<string, string> = {};
+    let confirmDropApiId = "";
+    let confirmClearMap: Record<string, { drop: number; tail: string }> = {};
 
     /** 当前选中的模型名；入参给 store 值，别读可能还没就绪的 cfg */
     function currentModel(s = $settings): string {
@@ -99,10 +101,15 @@
     function removeApi(id: string) {
         const latest = $settings;
         if (latest.apis.length <= 1) {
-            alert("至少要留一套 API，不能全删");
+            confirmDropApiId = "";
+            testResult = { ...testResult, [id]: "至少要留一套 API，不能全删" };
             return;
         }
-        if (!confirm("删掉这套 API？它的地址、密钥和模型都会一起删掉。")) return;
+        if (confirmDropApiId !== id) {
+            confirmDropApiId = id;
+            return;
+        }
+        confirmDropApiId = "";
         const next = latest.apis.filter((a) => a.id !== id);
         const activeApiId = latest.activeApiId === id ? next[0].id : latest.activeApiId;
         updateSettingsWith((s) => ({ ...s, apis: next, activeApiId }), (s) => persist(s));
@@ -130,8 +137,8 @@
 
     /** 手动添加也能标出用途，加完给一句人话 */
     function addModelHint(text: string): string {
-        if (isImageModel(text)) return `已加入画图模型：${text}。在面板里选它就会进生图模式。`;
-        if (!isChatModel(text)) return `已加入：${text}。注意这个名字看起来不能聊天，也不能生图。`;
+        if (isImageModelOf(text, manualImage)) return `已加入画图模型：${text}。在面板里选它就会进生图模式。`;
+        if (!isChatModelOf(text, manualImage)) return `已加入：${text}。注意这个名字看起来不能聊天，也不能生图。`;
         return `已加入聊天模型：${text}`;
     }
 
@@ -223,7 +230,8 @@
      * 之后切到画图模型了，「优化提示词」还能找回它。
      */
     function pickModel(id: string, model: string) {
-        const chatty = isChatModel(model);
+        const chatty = isChatModelOf(model, manualImage);
+        const drawy = isImageModelOf(model, manualImage);
         updateSettingsWith(
             (s) => {
                 if (!s.apis.some((a) => a.id === id)) return s;
@@ -238,74 +246,78 @@
             ...testResult,
             [id]: busy
                 ? `已切到 ${model}。这一轮已经发出去了，下一轮生效。`
-                : isImageModel(model)
+                : drawy
                 ? `已切到 ${model}。这是画图模型，在面板里会进入生图模式。`
                 : `已切到 ${model}。点「测试这个 API」可以验证它能不能用。`,
         };
     }
 
-    /**
-     * 清除没选中的模型，保留当前选中的那个。
-     *
-     * 主人在一堆拉回来的模型里挑好了一个，其余的都是噪音；
-     * 全清光会把选中的也删掉，等于白挑一次。
-     *
-     * 但画图模型不能跟着被清掉：生图功能要靠它们，
-     * 清完只剩一个聊天模型，主人会发现「生图模式没模型可选了」。
-     */
-    /**
-     * 清除没勾选的模型。
-     *
-     * 保留三类（只要沾到一个就不删）：
-     *   1. 勾选过的（picked）—— 主人自己挑出来的，绝不能动
-     *   2. 画图模型 —— 生图要用
-     *   3. 当前正在用的那个
-     *
-     * 以前只保留后两类，导致"勾了 5 个，点清除只剩 1 个"。
-     */
-    function clearModels(id: string) {
+    function clearModelsPlan(
+        id: string
+    ):
+        | { error: string }
+        | { api: ApiConfig | undefined; all: string[]; pickedList: string[]; keepSet: Set<string>; drop: number; tail: string } {
         const api = $settings.apis.find((a) => a.id === id);
         const all = api?.models || [];
-        if (!all.length) {
-            testResult = { ...testResult, [id]: "这套 API 本来就没有模型" };
-            return;
-        }
+        if (!all.length) return { error: "这套 API 本来就没有模型" };
 
         // 勾选的（老对象没有 picked 时按"全选"处理，此时没有可清除的）
         const pickedList = Array.isArray(api?.picked) ? api.picked : all;
         const keepSet = new Set<string>([
             ...pickedList,
-            ...all.filter((m) => isImageModel(m)),
+            ...all.filter((m) => isImageModelOf(m, manualImage)),
         ]);
         if (api?.model) keepSet.add(api.model);
 
         const drop = all.length - keepSet.size;
         if (drop <= 0) {
-            testResult = {
-                ...testResult,
-                [id]: "所有模型都被勾选/在用/是画图模型，没有可清除的",
-            };
-            return;
+            return { error: "所有模型都被勾选/在用/是画图模型，没有可清除的" };
         }
 
         const keptPicked = pickedList.filter((m) => all.includes(m)).length;
-        const keptImage = all.filter((m) => isImageModel(m) && !pickedList.includes(m)).length;
+        const keptImage = all.filter((m) => isImageModelOf(m, manualImage) && !pickedList.includes(m)).length;
         const parts: string[] = [];
         if (keptPicked) parts.push(`勾选的 ${keptPicked} 个`);
         if (keptImage) parts.push(`画图模型 ${keptImage} 个`);
         const tail = parts.length ? `（保留：${parts.join("、")}）` : "";
 
-        if (!confirm(`清除 ${drop} 个没勾选的模型${tail}？`)) return;
+        return { api, all, pickedList, keepSet, drop, tail };
+    }
 
-        const nextModels = all.filter((m) => keepSet.has(m));
-        const nextPicked = pickedList.filter((m) => nextModels.includes(m));
+    function clearModels(id: string) {
+        const plan = clearModelsPlan(id);
+        if ("error" in plan) {
+            const next = { ...confirmClearMap };
+            delete next[id];
+            confirmClearMap = next;
+            testResult = { ...testResult, [id]: plan.error };
+            return;
+        }
+        confirmClearMap = { ...confirmClearMap, [id]: { drop: plan.drop, tail: plan.tail } };
+    }
+
+    function cancelClearModels(id: string) {
+        const next = { ...confirmClearMap };
+        delete next[id];
+        confirmClearMap = next;
+    }
+
+    function confirmClearModels(id: string) {
+        cancelClearModels(id);
+        const plan = clearModelsPlan(id);
+        if ("error" in plan) {
+            testResult = { ...testResult, [id]: plan.error };
+            return;
+        }
+        const nextModels = plan.all.filter((m) => plan.keepSet.has(m));
+        const nextPicked = plan.pickedList.filter((m) => nextModels.includes(m));
         updateApiWith(id, () => ({
             models: nextModels,
             picked: nextPicked,
             // 当前模型一定还在（上面已经加进 keepSet）
-            model: api?.model && nextModels.includes(api.model) ? api.model : nextModels[0] || "",
+            model: plan.api?.model && nextModels.includes(plan.api.model) ? plan.api.model : nextModels[0] || "",
         }));
-        testResult = { ...testResult, [id]: `已清除 ${drop} 个没勾选的${tail}` };
+        testResult = { ...testResult, [id]: `已清除 ${plan.drop} 个没勾选的${plan.tail}` };
     }
 
     function patch(p: Partial<Settings>) {
@@ -393,9 +405,12 @@
 
         let text = "";
         let done = false;
+        let timer: any = null;
+        let handle: { abort: () => void } | null = null;
         const settle = (msg: string) => {
             if (done) return;
             done = true;
+            if (timer) clearTimeout(timer);
             testing = { ...testing, [api.id]: false };
             testResult = { ...testResult, [api.id]: msg };
         };
@@ -409,7 +424,7 @@
         // 全局偏好（温度/上限/思考）跟当前设置走，只是把模型换成这套 API 的
         const runCfg = { ...$settings, ...api, model };
 
-        streamChat(
+        handle = streamChat(
             {
                 url: endpointFor(api.protocol, api.baseURL, model),
                 headers: headersFor(api.protocol, api),
@@ -439,8 +454,14 @@
             }
         );
 
-        // 兜底：30 秒还没结果就报超时，避免按钮一直转
-        setTimeout(() => settle("失败：30 秒内没有响应，检查地址是否可达"), 30000);
+        // 兜底：30 秒还没结果就报超时，同时真正掐断底层请求
+        timer = setTimeout(() => {
+            if (done) return;
+            try {
+                handle?.abort();
+            } catch {}
+            settle("失败：30 秒内没有响应，检查地址是否可达");
+        }, 30000);
     }
 </script>
 
@@ -466,7 +487,12 @@
                 {:else}
                     <button class="card-btn" on:click={() => useApi(api.id)}>设为当前</button>
                 {/if}
-                <button class="card-del" on:click={() => removeApi(api.id)} title="删除这套 API">删除</button>
+                {#if confirmDropApiId === api.id}
+                    <button class="card-del confirm" on:click={() => removeApi(api.id)}>确认删</button>
+                    <button class="card-btn" on:click={() => (confirmDropApiId = "")}>取消</button>
+                {:else}
+                    <button class="card-del" on:click={() => removeApi(api.id)} title="删除这套 API">删除</button>
+                {/if}
             </div>
 
             {#if openId === api.id}
@@ -508,6 +534,13 @@
                             </button>
                         {/if}
                     </div>
+                    {#if confirmClearMap[api.id]}
+                        <div class="confirm-bar">
+                            <span>清除 {confirmClearMap[api.id].drop} 个没勾选的模型{confirmClearMap[api.id].tail}？</span>
+                            <button class="confirm-yes" on:click={() => confirmClearModels(api.id)}>确认清除</button>
+                            <button class="confirm-no" on:click={() => cancelClearModels(api.id)}>取消</button>
+                        </div>
+                    {/if}
                     {#if chatModelsOf(api).length}
                         <div class="group-label">聊天模型 <em>（优化提示词也用这一组）</em></div>
                         <div class="model-list">
@@ -807,9 +840,41 @@
         font-family: inherit;
         flex-shrink: 0;
     }
-    .card-del:hover {
+    .card-del:hover,
+    .card-del.confirm {
         color: var(--b3-theme-error);
         opacity: 1;
+    }
+    .confirm-bar {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 5px 8px;
+        margin-bottom: 6px;
+        border: 1px solid var(--b3-theme-error);
+        border-radius: 5px;
+        font-size: 11px;
+        line-height: 1.5;
+    }
+    .confirm-bar span {
+        flex: 1;
+        min-width: 120px;
+    }
+    .confirm-yes,
+    .confirm-no {
+        border: 1px solid var(--b3-border-color);
+        background: none;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        font-family: inherit;
+    }
+    .confirm-yes {
+        border-color: var(--b3-theme-error);
+        background: var(--b3-theme-error);
+        color: #fff;
     }
     .collapsed {
         display: flex;
